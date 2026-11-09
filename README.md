@@ -18,13 +18,15 @@ Both launchers look for Python 3.10 or later with working Tcl/Tk, create a local
 
 1. Power on the printer and pair it with your computer. Close any phone app currently using the printer.
 2. On Windows, select its **outgoing** Bluetooth serial port. Windows lists it under Bluetooth settings → More Bluetooth settings → COM Ports. On the tested D30N, it was `COM3`.
-3. On Linux, pair with BlueZ and expose the printer’s Serial Port Profile using RFCOMM. For example, with the printer’s Bluetooth address and SPP channel, run `sudo rfcomm bind 0 AA:BB:CC:DD:EE:FF 1` and select `/dev/rfcomm0`. Use your actual SPP channel if it differs. Your account needs permission to open that device, commonly through the distribution’s serial-device group. Keep the application running as your regular user.
-4. Click **Find printers** to refresh the list, then select the printer or enter its outgoing serial port. Stupid Print identifies the selected protocol by querying the printer. The library and last port reopen at startup.
+3. On Linux, turn on Bluetooth and pair the printer in system Bluetooth settings. Stupid Print lists paired D30, D30N and P21 printers by name and connects through BlueZ. It selects a single recognized printer automatically. If the printer is missing, click **Find printers** to scan nearby. A device marked **Setup needed** shows what to do when selected. Pair it in system settings and refresh the list.
+4. Click **Check status** to verify the connection. The app checks the printer’s protocol and remembers the selected device. On Linux, you can also enter a paired printer’s Bluetooth address. Existing manual connections such as `/dev/rfcomm0` still work if your account has permission to open the device.
 5. With a P21 and a readable roll tag, use **Use loaded roll** to apply the printer’s reported label size. The **40 × 14 mm** preset matches Nelko’s included 14 × 40 mm gap labels. If the tag is unreadable, select the size manually. The app checks readable stock again before printing. [Nelko P21 specifications](https://nelko.com/products/nelko-p21-portable-bluetooth-label-printer)
 
-Use **Profiles** to save a named serial port, model and tape width. **Save & use** applies the profile to the current label. A readable P21 roll tag can supply the tape width in the profile editor after a status check. Enter the width manually for D30 and D30N profiles.
+Use **Profiles** to save a named printer or serial port, model and tape width. **Save & use** applies the profile to the current label. A readable P21 roll tag can supply the tape width in the profile editor after a status check. Enter the width manually for D30 and D30N profiles.
 
-The D30N protocol has been tested on Windows. The P21 implementation is based on captured serial traffic and still needs a physical test. Linux Bluetooth hardware also needs an end-to-end test. Both drivers use RFCOMM serial.
+Linux discovery requires the distribution’s BlueZ Bluetooth service. If the printer was paired using its Bluetooth Low Energy entry, pair its Bluetooth Classic entry if available. The app needs the printer’s Serial Port Profile. If the printer is already connected to a phone, close the phone app and retry.
+
+The D30N protocol has been tested on Windows. The P21 implementation is based on captured serial traffic and still needs a physical test. Linux discovery and RFCOMM socket handoff have been tested with a simulated BlueZ service. Both drivers use RFCOMM serial.
 
 ## Design and save labels
 

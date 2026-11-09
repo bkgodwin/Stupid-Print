@@ -1,6 +1,8 @@
 import struct
+import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -14,7 +16,7 @@ from stupid_print.fonts import font_picker_sections
 from stupid_print.model import (Batch, Library, Selection, element, excel_sheets, import_data,
                                 new_document, read_document)
 from stupid_print.printer import (D30, P21, PRINT_COMPLETE, P21_ROLL, P21_STATUS, LabelRoll,
-                                  PrinterPort, PrinterStatus, _label_roll, _nelko_config,
+                                  PrinterPort, PrinterStatus, _bluetooth_ports, _label_roll, _nelko_config,
                                   available_ports, connect_printer, nelko_packet, suggested_port)
 from stupid_print.render import HEAD_DOTS, embed_image, raster_packet, render_label
 
@@ -248,6 +250,49 @@ class FontTests(unittest.TestCase):
 
 
 class PrinterTests(unittest.TestCase):
+    def test_linux_detects_a_paired_model_with_a_custom_alias(self):
+        def device(address, name, *, alias="", paired=True, powered=True, serial_port=True):
+            return SimpleNamespace(address=address, name=name, alias=alias, paired=paired, powered=powered,
+                                   serial_port=serial_port, classic=True)
+
+        address = "00:11:22:33:44:55"
+        devices = [device(address, "D30N", alias="Disabled adapter", powered=False),
+                   device(address, "D30N", alias="Office printer"),
+                   device("AA:BB:CC:DD:EE:FF", "P21", paired=False, serial_port=False),
+                   device("11:22:33:44:55:66", "Diagnostic adapter"),
+                   device("22:33:44:55:66:77", "Headset", serial_port=False)]
+        with patch("stupid_print.printer.sys.platform", "linux"):
+            ports = _bluetooth_ports(devices)
+            self.assertEqual(len(ports), 3)
+            port = suggested_port(ports)
+            self.assertEqual(port.device, "bluetooth:" + address)
+            self.assertEqual(port.display, "Office printer  ·  " + address)
+            self.assertEqual(port.hint, "D30")
+            self.assertIn("Pair this printer", ports["bluetooth:AA:BB:CC:DD:EE:FF"].issue)
+            self.assertIsNone(suggested_port({"generic": ports["bluetooth:11:22:33:44:55:66"]}))
+
+    def test_direct_linux_printer_uses_the_delivered_stream_instead_of_pyserial(self):
+        reply = bytes.fromhex("1a 06 89 1a 07 00 00 09")
+        stream = SimpleNamespace(write=len)
+        addresses = []
+
+        @contextmanager
+        def open_rfcomm(address):
+            addresses.append(address)
+            yield stream
+
+        bluetooth = SimpleNamespace(open_rfcomm=open_rfcomm)
+        with (patch("stupid_print.printer.sys.platform", "linux"),
+              patch.dict(sys.modules, {"stupid_print.linux_bluetooth": bluetooth}),
+              patch("stupid_print.printer.serial.Serial") as serial,
+              patch("stupid_print.printer.time.sleep"),
+              patch.object(D30, "_read", return_value=reply)):
+            with connect_printer(PrinterPort("bluetooth:aa:bb:cc:dd:ee:ff", "D30N")) as (printer, status):
+                self.assertIs(printer.serial, stream)
+                self.assertTrue(status.recognized)
+            serial.assert_not_called()
+        self.assertEqual(addresses, ["AA:BB:CC:DD:EE:FF"])
+
     def test_status_distinguishes_ready_and_paper_out(self):
         self.assertEqual(PrinterStatus(bytes.fromhex("1a06881a0500")).issue, "Paper not detected")
         ready = PrinterStatus(bytes.fromhex("1a06901a06891a0c0a1a07000009"))

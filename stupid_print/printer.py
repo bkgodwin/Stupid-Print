@@ -1,10 +1,12 @@
 """Bluetooth Classic discovery and print protocols for the D30 and P21."""
 
+import errno
 import glob
 import os
 import re
+import sys
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 
 import serial
@@ -32,20 +34,39 @@ class PrinterPort:
     device: str
     name: str = ""
     protocol: str = ""
+    issue: str = ""
 
     @property
     def display(self):
-        return f"{self.name}  ·  {self.device}" if self.name else self.device
+        target = self.bluetooth_address or self.device
+        if self.name and self.name not in (target, target.replace(":", "-")):
+            target = f"{self.name}  ·  {target}"
+        return f"{target}  ·  Setup needed" if self.issue else target
+
+    @property
+    def bluetooth_address(self):
+        if sys.platform != "linux":
+            return None
+        address = self.device.removeprefix("bluetooth:")
+        if re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", address, re.IGNORECASE):
+            return address.upper()
+
+    @property
+    def key(self):
+        address = self.bluetooth_address
+        return f"bluetooth:{address}" if address else self.device
 
     @property
     def hint(self):
-        if self.protocol:
-            return self.protocol
-        if re.search(r"(?<![A-Z0-9])D30[A-Z]?(?![A-Z0-9])", self.name, re.IGNORECASE):
-            return "D30"
-        if re.search(r"(?<![A-Z0-9])P21(?![A-Z0-9])", self.name, re.IGNORECASE):
-            return "P21"
-        return ""
+        return self.protocol or _model_hint(self.name)
+
+
+def _model_hint(name):
+    if re.search(r"(?<![A-Z0-9])D30[A-Z]?(?![A-Z0-9])", name, re.IGNORECASE):
+        return "D30"
+    if re.search(r"(?<![A-Z0-9])P21(?![A-Z0-9])", name, re.IGNORECASE):
+        return "P21"
+    return ""
 
 
 def _windows_bluetooth_name(address):
@@ -90,11 +111,51 @@ def available_ports():
     return result
 
 
+def _bluetooth_ports(devices):
+    ranked = {}
+    for device in devices:
+        hint = _model_hint(device.name) or _model_hint(device.alias)
+        if not hint and not (device.paired and device.serial_port):
+            continue
+        issue = ""
+        if not device.powered:
+            issue = "Turn on Bluetooth in Linux Bluetooth settings, then click Find printers."
+        elif not device.paired:
+            issue = "Pair this printer in Linux Bluetooth settings, then click Find printers."
+        elif not device.classic:
+            issue = "Pair the printer’s Bluetooth Classic entry in Linux Bluetooth settings."
+        key = "bluetooth:" + device.address
+        name = device.alias or device.name or "Bluetooth serial device"
+        score = (not issue, device.paired, device.powered, device.serial_port, bool(hint))
+        if key not in ranked or score > ranked[key][0]:
+            ranked[key] = score, PrinterPort(key, name, hint, issue)
+    return {key: port for key, (_, port) in sorted(ranked.items(), key=lambda item: item[1][1].display.casefold())}
+
+
+def discover_printers(scan=False):
+    try:
+        ports, serial_note = available_ports(), ""
+    except OSError as exc:
+        ports, serial_note = {}, f"Could not list serial ports: {exc}"
+    if sys.platform != "linux":
+        return ports, serial_note
+    try:
+        from .linux_bluetooth import discover
+
+        devices, note = discover(scan)
+    except ImportError:
+        return ports, "Bluetooth discovery support is missing. Run ./start.sh to update the app’s dependencies."
+    return {**_bluetooth_ports(devices), **ports}, note or serial_note
+
+
 def suggested_port(ports):
-    recognized = [port for port in ports.values() if port.hint]
+    usable = [port for port in ports.values() if not port.issue]
+    recognized = [port for port in usable if port.hint]
     if len(recognized) == 1:
         return recognized[0]
-    return next(iter(ports.values())) if len(ports) == 1 else None
+    if len(usable) == 1 and not usable[0].bluetooth_address:
+        return usable[0]
+    return None
 
 
 def _value(response, field):
@@ -145,17 +206,26 @@ class PrinterStatus:
 class SerialPrinter:
     baudrate = 9600
 
-    def __init__(self, port):
+    def __init__(self, port, *, stream=None):
         self.port = port
-        self.serial = None
+        self.serial = stream
+        self.owns_serial = stream is None
 
     def __enter__(self):
-        self.serial = serial.Serial(self.port, baudrate=self.baudrate, timeout=0.15, write_timeout=3,
-                                    exclusive=True if os.name != "nt" else None)
+        if self.owns_serial:
+            try:
+                self.serial = serial.Serial(self.port, baudrate=self.baudrate, timeout=0.15, write_timeout=3,
+                                            exclusive=True if os.name != "nt" else None)
+            except OSError as exc:
+                if sys.platform == "linux" and exc.errno in (errno.EACCES, errno.EPERM):
+                    raise OSError(f"Permission denied for {self.port}. Select the printer by Bluetooth name or "
+                                  "check your account’s serial port access.") from exc
+                raise
         return self
 
     def __exit__(self, *_):
-        self.serial.close()
+        if self.owns_serial:
+            self.serial.close()
 
     def _write(self, data):
         if self.serial.write(data) != len(data):
@@ -165,7 +235,7 @@ class SerialPrinter:
         end = time.monotonic() + seconds
         response = bytearray()
         while time.monotonic() < end:
-            available = self.serial.in_waiting or 1
+            available = (self.serial.in_waiting or 1) if self.owns_serial else 4096
             response.extend(self.serial.read(available if size is None else min(available, size - len(response))))
             if len(response) == size or any(marker in response for marker in stop):
                 break
@@ -341,11 +411,22 @@ class P21(SerialPrinter):
 
 @contextmanager
 def connect_printer(port):
+    address = port.bluetooth_address
+    transport = nullcontext()
+    if address:
+        try:
+            from .linux_bluetooth import open_rfcomm
+        except ImportError as exc:
+            raise OSError("Run ./start.sh to install Linux Bluetooth support.") from exc
+        transport = open_rfcomm(address)
     drivers = {"D30": (D30,), "P21": (P21,)}.get(port.hint, (D30, P21))
-    for driver in drivers:
-        with driver(port.device) as printer:
-            status = printer.identify()
-            if status is not None:
-                yield printer, status
-                return
-    raise OSError("No supported printer answered. Check the outgoing Bluetooth serial port.")
+    with transport as stream:
+        for driver in drivers:
+            with driver(port.device, stream=stream) as printer:
+                status = printer.identify()
+                if status is not None:
+                    yield printer, status
+                    return
+    if address:
+        raise OSError("The Bluetooth device connected but did not answer as a D30 or P21. Check the printer model.")
+    raise OSError("No supported printer answered. Check that this is the outgoing Bluetooth serial port.")
