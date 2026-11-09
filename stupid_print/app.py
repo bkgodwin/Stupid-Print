@@ -10,12 +10,13 @@ from uuid import uuid4
 
 from PIL import Image, ImageTk
 
-from .dialogs import BatchSetup, ChoiceDialog, PrintDialog
+from .artwork import EMOJI_GRAPHICS, GRAPHICS
+from .dialogs import BatchSetup, ChoiceDialog, FontPicker, GraphicPicker, PrintDialog
 from .model import (EXTENSION, PRESETS, Batch, Library, dimensions, element, excel_sheets,
                     import_data, new_document, read_document, write_json)
 from . import placement
 from .printer import PrinterPort, available_ports, connect_printer, suggested_port
-from .render import BARCODES, DPI, EMOJIS, embed_image, font_catalog, render_label
+from .render import BARCODES, DPI, embed_image, render_label
 from .widgets import BatchList, button, configure_style, field, tree_with_scroll
 
 
@@ -164,7 +165,7 @@ class App:
         toolbar.pack(fill="x", pady=(0, 8))
         for name, action in (("+ Text", lambda: self.add_item("text")),
                              ("+ Barcode", lambda: self.add_item("barcode")),
-                             ("+ Image", self.add_image), ("+ Rule", lambda: self.add_item("line"))):
+                             ("+ Image", self.add_image), ("+ Graphic", self.add_graphic)):
             button(toolbar, name, action).pack(side="left", padx=(0, 4))
         ttk.Checkbutton(toolbar, text="Print dots", variable=self.print_dots,
                         command=self.preview_mode_changed).pack(side="right")
@@ -708,8 +709,10 @@ class App:
     def add_item(self, kind, **values):
         w, _ = dimensions(self.doc)
         _, top, _, bottom = placement.printable_area(self.doc)
-        height = min(bottom - top - 1, {"text": 4, "line": .25}.get(kind, 8))
-        width = min(w - 2, 10) if kind == "image" else w - 2
+        height = min(bottom - top - 1, {"text": 4, "line": .25, "graphic": 7}.get(kind, 8))
+        width = min(w - 2, 10) if kind in ("graphic", "image") else w - 2
+        if kind == "graphic" and values.get("asset") == "rule":
+            width, height = w - 2, .75
         previous = self.item()
         below = previous["y"] + previous["h"] + .5 if previous else top + 1
         y = below if below + height <= bottom else top + .5
@@ -735,6 +738,18 @@ class App:
                 self.add_item("image", **values)
         except (OSError, ValueError, Image.DecompressionBombError) as exc:
             messagebox.showerror("Import image", str(exc), parent=self.root)
+
+    def add_graphic(self, replace=False):
+        item = self.item() if replace else None
+        key = GraphicPicker(self.root, item["asset"] if item else None).result
+        if key is None:
+            return
+        if item:
+            item["asset"] = key
+            self.rebuild_elements()
+            self.changed()
+        else:
+            self.add_item("graphic", asset=key)
 
     def duplicate_item(self):
         copies = [{**source, "id": uuid4().hex} for source in self.items()]
@@ -769,6 +784,8 @@ class App:
 
     @staticmethod
     def layer_title(item):
+        if item["kind"] == "graphic":
+            return f"Graphic   {GRAPHICS[item['asset']].name}"
         name = item.get("value") or item.get("filename") or ""
         summary = " ".join(name.split())
         if len(summary) > 30:
@@ -801,13 +818,15 @@ class App:
         elif item["kind"] == "image":
             ttk.Label(parent, text=item["filename"], wraplength=235).pack(anchor="w")
             button(parent, "Replace image…", lambda: self.add_image(True)).pack(anchor="w", pady=6)
+        elif item["kind"] == "graphic":
+            ttk.Label(parent, text=GRAPHICS[item["asset"]].name, style="Section.TLabel").pack(anchor="w")
+            button(parent, "Replace graphic…", lambda: self.add_graphic(True)).pack(anchor="w", pady=6)
         else:
             ttk.Label(parent, text="Use Place to position and size this rule.",
                       wraplength=245, style="Muted.TLabel").pack(anchor="w")
         parent = self.style_panel
         if item["kind"] == "text":
-            families = ("Default", *sorted(font_catalog(), key=str.casefold))
-            self.item_field(parent, item, "font", "Font family", families)
+            self.font_control(parent, item)
             self.item_field(parent, item, "size", "Text size (pt)", numeric=(3, 96))
             row = ttk.Frame(parent)
             row.pack(fill="x")
@@ -825,6 +844,23 @@ class App:
             self.check_item(parent, item, "dither", "Dither image")
             ttk.Label(parent, text="Dither photos for tonal detail. Turn it off for solid logos.",
                       wraplength=235, style="Muted.TLabel").pack(anchor="w", pady=5)
+        elif item["kind"] == "graphic":
+            self.check_item(parent, item, "dither", "Dither shading")
+            ttk.Label(parent, text="Turn off shading for a high-contrast graphic.",
+                      wraplength=235, style="Muted.TLabel").pack(anchor="w", pady=5)
+
+    def font_control(self, parent, item):
+        ttk.Label(parent, text="Font family", style="Muted.TLabel").pack(anchor="w", pady=(0, 2))
+        current = tk.StringVar(value=item["font"] + "…")
+
+        def choose():
+            chosen = FontPicker(self.root, item["font"]).result
+            if chosen is not None and chosen != item["font"]:
+                item["font"] = chosen
+                current.set(chosen + "…")
+                self.changed()
+
+        ttk.Button(parent, textvariable=current, command=choose).pack(fill="x", pady=(0, 5))
 
     def rebuild_placement(self):
         parent = self.place_panel
@@ -954,12 +990,16 @@ class App:
 
         choices.bind("<<ComboboxSelected>>", insert_token)
         if item["kind"] == "text":
+            entries = {}
+            for character, key in EMOJI_GRAPHICS.items():
+                entries.setdefault(GRAPHICS[key].name, character)
             emoji = tk.StringVar(value="Insert an emoji…")
-            picker = ttk.Combobox(parent, textvariable=emoji, state="readonly", values=EMOJIS, width=16)
+            picker = ttk.Combobox(parent, textvariable=emoji, state="readonly",
+                                  values=tuple(sorted(entries)), width=16)
             picker.pack(fill="x", pady=(0, 6))
 
             def insert_emoji(_):
-                text.insert("insert", emoji.get())
+                text.insert("insert", entries[emoji.get()])
                 emoji.set("Insert an emoji…")
                 text.focus_set()
 

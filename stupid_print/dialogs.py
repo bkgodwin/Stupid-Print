@@ -6,12 +6,14 @@ import time
 import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
 
-from PIL import Image, ImageTk
+from PIL import Image, ImageDraw, ImageTk
 
+from .artwork import GRAPHICS, graphic_layer
+from .fonts import font_picker_sections, select_font
 from .model import Batch, Selection, dimensions
 from .printer import connect_printer
 from .render import DPI, render_label
-from .widgets import BatchList, button, field
+from .widgets import BatchList, button, field, tree_with_scroll
 
 
 class SettingsDialog(simpledialog.Dialog):
@@ -41,6 +43,129 @@ class ChoiceDialog(SettingsDialog):
 
     def apply(self):
         self.result = self.variable.get()
+
+
+class GraphicPicker(SettingsDialog):
+    def __init__(self, parent, initial=None):
+        self.initial = initial
+        super().__init__(parent, "Built-in graphics")
+
+    def body(self, parent):
+        super().body(parent)
+        categories = tuple(dict.fromkeys(graphic.category for graphic in GRAPHICS.values()))
+        self.category = tk.StringVar(value=GRAPHICS[self.initial].category if self.initial else categories[0])
+        category = field(parent, "Category", self.category, categories)
+        category.bind("<<ComboboxSelected>>", lambda _: self.populate())
+        row = ttk.Frame(parent)
+        row.pack(fill="both", expand=True)
+        frame, self.tree = tree_with_scroll(row, ("name",), height=9, selectmode="browse")
+        self.tree.configure(show="")
+        self.tree.column("name", width=202)
+        frame.pack(side="left", fill="both", expand=True)
+        preview = ttk.Frame(row, padding=(12, 5))
+        preview.pack(side="left")
+        ttk.Label(preview, text="Print preview", style="Muted.TLabel").pack(pady=(0, 6))
+        self.sample = ttk.Label(preview)
+        self.sample.pack()
+        self.tree.bind("<<TreeviewSelect>>", lambda _: self.draw_sample())
+        self.tree.bind("<Double-Button-1>", self.ok)
+        self.populate(self.initial)
+        return self.tree
+
+    def populate(self, preferred=None):
+        self.tree.delete(*self.tree.get_children())
+        choices = [(key, value.name) for key, value in GRAPHICS.items() if value.category == self.category.get()]
+        for key, name in sorted(choices, key=lambda item: item[1].casefold()):
+            self.tree.insert("", "end", iid=key, values=(name,))
+        key = preferred if preferred and self.tree.exists(preferred) else self.tree.get_children()[0]
+        self.tree.selection_set(key)
+        self.tree.focus(key)
+        self.tree.see(key)
+        self.draw_sample()
+
+    def draw_sample(self):
+        selection = self.tree.selection()
+        if selection:
+            image = graphic_layer(selection[0], (64, 64)).resize((128, 128), Image.Resampling.NEAREST)
+            self.photo = ImageTk.PhotoImage(image, master=self)
+            self.sample.configure(image=self.photo)
+
+    def validate(self):
+        return bool(self.tree.selection())
+
+    def apply(self):
+        self.result = self.tree.selection()[0]
+
+
+class FontPicker(SettingsDialog):
+    def __init__(self, parent, initial):
+        self.chosen = initial
+        self.sections = font_picker_sections()
+        super().__init__(parent, "Choose a font")
+
+    def body(self, parent):
+        super().body(parent)
+        self.filter = tk.StringVar()
+        search = field(parent, "Search fonts", self.filter)
+        self.trees = []
+        for index, (title, height) in enumerate((("Recommended English fonts", 5), ("System fonts", 7))):
+            if index:
+                ttk.Separator(parent).pack(fill="x", pady=8)
+            ttk.Label(parent, text=title, style="Muted.TLabel").pack(anchor="w", pady=(0, 4))
+            frame, tree = tree_with_scroll(parent, ("font",), height=height, selectmode="browse")
+            tree.configure(show="")
+            tree.column("font", width=360)
+            frame.pack(fill="x")
+            tree.bind("<<TreeviewSelect>>", lambda _, widget=tree: self.select_font(widget))
+            tree.bind("<Double-Button-1>", self.ok)
+            self.trees.append(tree)
+        self.sample = ttk.Label(parent, padding=(0, 9, 0, 0))
+        self.sample.pack()
+        self.filter.trace_add("write", lambda *_: self.populate())
+        self.populate()
+        return search
+
+    def populate(self):
+        query = self.filter.get().strip().casefold()
+        match = None
+        first = None
+        for tree, section in zip(self.trees, self.sections):
+            tree.delete(*tree.get_children())
+            for name in section:
+                if query in name.casefold():
+                    row = tree.insert("", "end", values=(name,))
+                    if first is None:
+                        first = (tree, row)
+                    if name == self.chosen:
+                        match = (tree, row)
+        if match or first:
+            tree, row = match or first
+            tree.selection_set(row)
+            tree.focus(row)
+            tree.see(row)
+            self.select_font(tree)
+        else:
+            self.sample.configure(image="", text="No usable fonts match your search.")
+
+    def select_font(self, tree):
+        selection = tree.selection()
+        if not selection:
+            return
+        for other in self.trees:
+            if other is not tree:
+                other.selection_remove(other.selection())
+        self.chosen = tree.set(selection[0], "font")
+        font, _, _ = select_font(self.chosen, 24)
+        image = Image.new("L", (360, 47), 255)
+        ImageDraw.Draw(image).text((180, 23), "Asset ID 0123456789", font=font, fill=0, anchor="mm")
+        self.photo = ImageTk.PhotoImage(image, master=self)
+        self.sample.configure(image=self.photo, text="")
+
+    def validate(self):
+        return any(tree.selection() for tree in self.trees)
+
+    def apply(self):
+        self.result = self.chosen
 
 
 class BatchSetup(SettingsDialog):

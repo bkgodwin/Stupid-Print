@@ -5,10 +5,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from PIL import Image
+from PIL import Image, ImageFont
 from openpyxl import Workbook
 
 from stupid_print import placement
+from stupid_print.artwork import graphic_layer
+from stupid_print.fonts import font_picker_sections
 from stupid_print.model import (Batch, Library, Selection, element, excel_sheets, import_data,
                                 new_document, read_document)
 from stupid_print.printer import (D30, P21, PRINT_COMPLETE, P21_ROLL, P21_STATUS, LabelRoll,
@@ -82,6 +84,30 @@ class BatchTests(unittest.TestCase):
 
 
 class RenderTests(unittest.TestCase):
+    def test_tag_emoji_prints_ink_without_an_installed_emoji_font(self):
+        doc = new_document()
+        doc["elements"][0]["value"] = "\U0001F3F7\ufe0f"
+        with patch("stupid_print.render.font_catalog", side_effect=AssertionError("system emoji fallback used")):
+            batch = Batch(doc)
+            preview = render_label(doc, batch, 0, smooth=True)
+            native = render_label(doc, batch, 0)
+        self.assertGreater(sum(preview.histogram()[1:255]), 0)
+        self.assertGreater(native.histogram()[0], 40)
+
+    def test_shaded_graphic_round_trips_as_a_catalog_key(self):
+        doc = new_document()
+        doc["elements"] = [element("graphic", asset="package", w=8, h=8)]
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            library = Library(directory)
+            library.save(doc)
+            doc = read_document(library.list()[0])
+        self.assertEqual(doc["elements"][0]["asset"], "package")
+        self.assertNotIn("image", doc["elements"][0])
+        dithered = graphic_layer("package", (64, 64))
+        solid = graphic_layer("package", (64, 64), dither=False)
+        self.assertGreater(dithered.histogram()[0], solid.histogram()[0])
+        self.assertGreater(render_label(doc, Batch(doc), 0).histogram()[0], 0)
+
     def test_raster_dimensions_rotation_and_ink(self):
         image = Image.new("1", (176, HEAD_DOTS), 1)
         image.putpixel((0, HEAD_DOTS - 1), 0)
@@ -127,6 +153,19 @@ class RenderTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "check digit"):
             render_label(doc, Batch(doc), 0)
 
+    def test_upc_a_accepts_scanner_and_human_readable_forms(self):
+        doc = new_document()
+        code = element("barcode", value="03600029145", x=5, w=28.25, symbology="UPC-A")
+        doc["elements"] = [code]
+        expected = render_label(doc, Batch(doc), 0).tobytes()
+        for value in ("036000291452", "0 36000 29145 2", "0-036000291452"):
+            with self.subTest(value=value):
+                code["value"] = value
+                self.assertEqual(render_label(doc, Batch(doc), 0).tobytes(), expected)
+        code["value"] = "0036000291453"
+        with self.assertRaisesRegex(ValueError, "check digit"):
+            render_label(doc, Batch(doc), 0)
+
     def test_narrow_barcode_requires_explicit_compact_mode(self):
         doc = new_document()
         item = element("barcode", value="007", w=20)
@@ -146,6 +185,20 @@ class RenderTests(unittest.TestCase):
         scan_region = (16, 24, 288, 72)
         self.assertEqual(composite.crop(scan_region).tobytes(), alone.crop(scan_region).tobytes())
         self.assertEqual(composite.getpixel((0, 35)), 0)
+
+    def test_barcode_refuses_artwork_over_the_scan_area_and_clipped_stock(self):
+        doc = new_document()
+        doc["height"] = 14
+        code = element("barcode", x=2, y=3, w=34, h=6, value="007")
+        mark = element("graphic", asset="rectangle", x=2, y=4, w=6, h=4)
+        doc["elements"] = [code, mark]
+        with self.assertRaisesRegex(ValueError, "Artwork covers"):
+            render_label(doc, Batch(doc), 0)
+        doc["elements"].reverse()
+        self.assertGreater(render_label(doc, Batch(doc), 0).histogram()[0], 0)
+        code["y"] = 0
+        with self.assertRaisesRegex(ValueError, "inside the printable area"):
+            render_label(doc, Batch(doc), 0)
 
 
 class PlacementTests(unittest.TestCase):
@@ -178,6 +231,20 @@ class PlacementTests(unittest.TestCase):
                  element("image", x=8.2, y=5.4, w=8, h=4)]
         placement.move(items, placement.bounds(items), 2.4, 12, (40, 12), snap=True)
         self.assertEqual([(item["x"], item["y"]) for item in items], [(5, 5), (11, 8)])
+
+
+class FontTests(unittest.TestCase):
+    def test_picker_places_recommended_first_and_excludes_unusable_faces(self):
+        font = ImageFont.load_default(size=24)
+        good = SimpleNamespace(load=lambda _: font)
+        tofu = SimpleNamespace(load=lambda _: SimpleNamespace(getmask=lambda _: font.getmask("?")))
+        variants = lambda face: {(False, False): face}
+        catalog = {"Other valid": variants(good), "Arial": variants(good),
+                   "Broken glyphs": variants(tofu), "AMGDT": variants(good)}
+        with patch("stupid_print.fonts.font_catalog", return_value=catalog):
+            recommended, system = font_picker_sections.__wrapped__()
+        self.assertEqual(recommended, ("Default", "Arial"))
+        self.assertEqual(system, ("Other valid",))
 
 
 class PrinterTests(unittest.TestCase):
