@@ -4,3 +4,4 @@ openpyxl>=3.1.5,<4
 python-barcode>=0.16,<1
 zxing-cpp>=3,<4
 reportlab>=4,<5
+dbus-fast>=2.46,<6; sys_platform == "linux"

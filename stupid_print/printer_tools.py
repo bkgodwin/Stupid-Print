@@ -32,7 +32,8 @@ class ProfilesDialog(SettingsDialog):
         control = field(parent, "Choose a profile", self.choice, options, width=34)
         control.bind("<<ComboboxSelected>>", lambda _: self.load())
         name = field(parent, "Profile name", self.name)
-        field(parent, "Bluetooth serial port", self.device, tuple(self.app.ports), editable=True)
+        field(parent, "Bluetooth printer or serial port", self.device,
+              tuple(port.display for port in self.app.ports.values()), editable=True)
         field(parent, "Printer model", self.model, tuple(MODELS))
         field(parent, "Tape width (mm)", self.width)
         button(parent, "Use detected tape width", self.detect_width).pack(anchor="w")
@@ -59,7 +60,8 @@ class ProfilesDialog(SettingsDialog):
         key = self.choice.get()
         profile = self.profiles.get(key, self.defaults)
         self.name.set("" if key == NEW_PROFILE else key)
-        self.device.set(profile["port"])
+        port = self.app.resolve_port(profile["port"])
+        self.device.set(port.display if port else "")
         self.model.set(profile["model"])
         self.width.set(f"{profile['width']:g}")
         self.error.set("")
@@ -71,17 +73,19 @@ class ProfilesDialog(SettingsDialog):
 
     def detect_width(self):
         roll = self.app.loaded_roll
-        if self.app.printer_busy or not roll or self.device.get().strip() != self.app.checked_device:
+        port = self.app.resolve_port(self.device.get())
+        if self.app.printer_busy or not roll or not port or port.device != self.app.checked_device:
             self.error.set("Check status on this printer first. Tape width is available from a readable P21 roll tag.")
             return
         self.width.set(f"{roll.width:g}")
         self.error.set("")
 
     def validate(self):
-        name, device = self.name.get().strip(), self.device.get().strip()
+        name = self.name.get().strip()
+        port = self.app.resolve_port(self.device.get())
         previous = self.choice.get()
-        if not 1 <= len(name) <= 60 or name == NEW_PROFILE or not device:
-            self.error.set("Enter a profile name (up to 60 characters) and a serial port.")
+        if not 1 <= len(name) <= 60 or name == NEW_PROFILE or not port:
+            self.error.set("Enter a profile name (up to 60 characters) and choose a printer or port.")
             return False
         if any(key.casefold() == name.casefold() and key != previous for key in self.profiles):
             self.error.set("A profile with this name already exists.")
@@ -93,7 +97,7 @@ class ProfilesDialog(SettingsDialog):
         except ValueError:
             self.error.set("Enter a tape width from 5 through 15 mm.")
             return False
-        self.result = (previous, name, {"port": device, "model": self.model.get(), "width": width})
+        self.result = (previous, name, {"port": port.device, "model": self.model.get(), "width": width})
         return True
 
     def delete(self):

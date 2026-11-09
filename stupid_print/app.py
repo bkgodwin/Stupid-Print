@@ -4,8 +4,10 @@ import copy
 import json
 import queue
 import sqlite3
+import sys
 import threading
 import tkinter as tk
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -19,7 +21,7 @@ from .jobs import JobStore
 from .model import (EXTENSION, MATRIX_CODES, PRESETS, QR_LEVELS, Batch, Library, dimensions, element,
                     excel_sheets, import_data, new_document, read_document, validate_element, write_json)
 from . import placement
-from .printer import PrinterPort, available_ports, connect_printer, suggested_port
+from .printer import PrinterPort, connect_printer, discover_printers, suggested_port
 from .printer_tools import MODELS, JobHistoryDialog, ProfilesDialog, StockDialog
 from .proof import PAPER_SIZES
 from .render import BARCODES, DPI, embed_image, render_label
@@ -94,9 +96,7 @@ class App:
             self.load_project(previous)
         else:
             self.load_editor()
-        self.find_ports()
-        if self.port.get():
-            self.root.after(450, self.check_printer)
+        self.root.after(80, self.refresh_printers)
 
     def build(self):
         header = ttk.Frame(self.root, style="Header.TFrame", padding=(19, 12))
@@ -179,8 +179,10 @@ class App:
         self.port_field.bind("<Return>", lambda _: self.check_printer())
         actions = ttk.Frame(parent)
         actions.pack(fill="x")
-        button(actions, "Check status", self.check_printer).pack(side="left")
-        button(actions, "Find printers", self.refresh_printers).pack(side="left", padx=5)
+        self.check_button = button(actions, "Check status", self.check_printer)
+        self.check_button.pack(side="left")
+        self.find_button = button(actions, "Find printers", lambda: self.refresh_printers(scan=True))
+        self.find_button.pack(side="left", padx=5)
         self.use_roll_button = button(parent, "Use loaded roll", self.use_loaded_roll)
         self.use_roll_button.state(["disabled"])
         self.use_roll_button.pack(fill="x", pady=(5, 0))
@@ -323,36 +325,84 @@ class App:
         elif selected and self.library_tree.exists(selected[0]):
             self.library_tree.selection_set(selected[0])
 
-    def find_ports(self):
-        try:
-            port = self.selected_port()
-            self.ports = available_ports()
-        except OSError as exc:
-            self.printer_detail.set(str(exc))
+    def refresh_printers(self, scan=False):
+        if self.printer_busy:
             return
+        previous = self.selected_port()
+        nearby = scan and sys.platform == "linux"
+        self.set_printer_busy(True)
+        self.show_printer_status("Finding printers…", "Looking for paired and nearby printers." if nearby else
+                                 "Looking for available printer connections.")
+
+        def discover():
+            self.status_events.put(discover_printers(scan=nearby))
+
+        threading.Thread(target=discover, daemon=True).start()
+        self.root.after(100, lambda: self.poll_discovery(previous))
+
+    def poll_discovery(self, previous):
+        try:
+            self.ports, note = self.status_events.get_nowait()
+        except queue.Empty:
+            self.root.after(100, lambda: self.poll_discovery(previous))
+            return
+        self.set_printer_busy(False)
         self.port_field.configure(values=tuple(candidate.display for candidate in self.ports.values()))
-        port = self.ports.get(port.device, port) if port else suggested_port(self.ports)
+        recommended = suggested_port(self.ports)
+        port = self.ports.get(previous.device, previous) if previous else recommended
+        # A legacy rfcomm binding may disappear at reboot. Prefer a detected printer in that case.
+        if (previous and previous.device.startswith("/dev/rfcomm")
+                and previous.device not in self.ports and recommended):
+            port = recommended
+        if not port and len(self.ports) == 1:
+            only_port = next(iter(self.ports.values()))
+            if only_port.issue:
+                port = only_port
         if port:
             self.port.set(port.display)
-        else:
-            self.printer_title.set("Printer offline")
-            self.printer_detail.set("Pair a D30 or P21 and select its outgoing Bluetooth serial port.")
-
-    def refresh_printers(self):
-        if not self.printer_busy:
-            self.find_ports()
-            if self.selected_port():
+            if port.issue:
+                note = port.issue
+            elif not (note and port.bluetooth_address and port.device not in self.ports):
                 self.check_printer()
+                return
+        elif self.ports and not note:
+            usable = any(not candidate.issue for candidate in self.ports.values())
+            note = ("Choose a printer from the list." if usable else
+                    "A printer needs setup. Select it for pairing instructions.")
+        elif not note:
+            note = ("Pair a D30 or P21 in Linux Bluetooth settings, then click Find printers." if
+                    sys.platform == "linux" else "Pair a D30 or P21 and select its outgoing Bluetooth serial port.")
+        title = "Setup needed" if port else "Choose a printer" if self.ports else "Printer offline"
+        self.show_printer_status(title, note)
 
-    def selected_port(self):
-        choice = self.port.get().strip()
+    def set_printer_busy(self, busy):
+        self.printer_busy = busy
+        state = ["disabled" if busy else "!disabled"]
+        for control in (self.port_field, self.check_button, self.find_button):
+            control.state(state)
+        if busy:
+            self.use_roll_button.state(["disabled"])
+
+    def show_printer_status(self, title, detail, tone="muted"):
+        self.printer_tone = tone
+        self.printer_badge.configure(foreground=self.colors[tone])
+        self.printer_title.set(title)
+        self.printer_detail.set(detail)
+
+    def resolve_port(self, choice):
+        choice = choice.strip()
         if not choice:
             return None
-        port = next((port for port in self.ports.values() if choice in (port.display, port.device)),
-                    PrinterPort(choice))
+        if match := next((port for port in self.ports.values() if choice == port.display), None):
+            return match
+        port = PrinterPort(choice)
+        return self.ports.get(port.key, replace(port, device=port.key))
+
+    def selected_port(self):
+        port = self.resolve_port(self.port.get())
         active = self.settings.get("profiles", {}).get(self.settings.get("active_profile"))
-        if active and active["port"] == port.device:
-            return PrinterPort(port.device, port.name, MODELS.get(active["model"], ""))
+        if port and active and active["port"] == port.device:
+            return replace(port, protocol=MODELS.get(active["model"]) or port.protocol)
         return port
 
     def show_active_profile(self):
@@ -397,7 +447,7 @@ class App:
             stock = self.jobs.stock(port.device, self.doc)
             length, width = dimensions(self.doc)
             size = f"{length:g} × {width:g} mm · {self.doc['media']}"
-            result = StockDialog(self.root, port.device, size, stock).result
+            result = StockDialog(self.root, port.display, size, stock).result
             if result is not None:
                 self.jobs.set_stock(port.device, self.doc, *result)
                 remaining = result[0]
@@ -413,16 +463,10 @@ class App:
         if port is None:
             self.loaded_roll = None
             self.use_roll_button.state(["disabled"])
-            self.printer_title.set("Printer offline")
-            self.printer_detail.set("Choose or enter a Bluetooth serial port.")
+            self.show_printer_status("Printer offline", "Click Find printers, or enter a serial port.")
             return
-        self.printer_busy = True
-        self.port_field.state(["disabled"])
-        self.use_roll_button.state(["disabled"])
-        self.printer_tone = "muted"
-        self.printer_badge.configure(foreground=self.colors[self.printer_tone])
-        self.printer_title.set("Checking printer…")
-        self.printer_detail.set(port.display)
+        self.set_printer_busy(True)
+        self.show_printer_status("Checking printer…", port.display)
         self.settings["port"] = port.device
         self.persist_settings()
 
@@ -430,9 +474,9 @@ class App:
             try:
                 with connect_printer(port) as (printer, status):
                     self.status_events.put((printer.model, status, ""))
-            except (OSError, ValueError):
-                self.status_events.put(("", None, f"Could not detect a printer on {port.device}. "
-                                                 "Check power, pairing, and the outgoing port."))
+            except (OSError, ValueError) as exc:
+                detail = str(exc) or "Check printer power and pairing."
+                self.status_events.put(("", None, detail))
 
         threading.Thread(target=check, daemon=True).start()
         self.root.after(100, self.poll_status)
@@ -443,20 +487,17 @@ class App:
         except queue.Empty:
             self.root.after(100, self.poll_status)
             return
-        self.printer_busy = False
-        self.port_field.state(["!disabled"])
+        self.set_printer_busy(False)
         self.checked_device = self.settings["port"]
         self.printer_model = model
         self.loaded_roll = status.roll if status else None
         ready = status is not None and not status.issue
-        self.printer_title.set(model or "Printer offline")
-        self.printer_tone = "good" if ready else "error"
-        self.printer_badge.configure(foreground=self.colors[self.printer_tone])
         if status:
-            self.printer_detail.set(f"{status.issue or 'Ready'} · {status.description}"
-                                    if status.issue != status.description else status.description)
+            detail = (f"{status.issue or 'Ready'} · {status.description}"
+                      if status.issue != status.description else status.description)
         else:
-            self.printer_detail.set(error)
+            detail = error
+        self.show_printer_status(model or "Printer offline", detail, "good" if ready else "error")
         if self.loaded_roll and self.loaded_roll.media in ("Gap labels", "Continuous tape"):
             self.use_roll_button.state(["!disabled"])
 
@@ -1347,7 +1388,7 @@ class App:
     def open_print(self):
         port = self.selected_port()
         if not port:
-            messagebox.showinfo("Print labels", "Select the printer’s Bluetooth serial port first.", parent=self.root)
+            messagebox.showinfo("Print labels", "Click Find printers and select a printer first.", parent=self.root)
             return
         try:
             batch = Batch(copy.deepcopy(self.doc))
