@@ -5,50 +5,68 @@ from tkinter import ttk
 from tkinter.font import nametofont
 
 
-BACKGROUND = "#edf0f7"
-PANEL = "#ffffff"
-INK = "#17233c"
-MUTED = "#56647e"
-ACCENT = "#4e3bd6"
-ACCENT_HOVER = "#4030b8"
-PREVIEW = "#dfe5f2"
-ERROR = "#a23546"
-GOOD = "#16734e"
+DARK = dict(background="#11141c", panel="#191e2a", field="#141924", raised="#252d3f",
+            ink="#ecf0fa", muted="#aab6ce", line="#384459", accent="#7967fb", hover="#353f58",
+            selected="#413875", selection_outline="#a896ff", stage="#101522",
+            shadow="#080b12", good="#62d8a9", error="#ff9dab", guide="#efbb68", header="#1b2031")
+LIGHT = dict(background="#edf0f7", panel="#ffffff", field="#f8f9fd", raised="#eef0f7",
+             ink="#17233c", muted="#56647e", line="#ccd4e4", accent="#4e3bd6", hover="#e1e6f6",
+             selected="#e6e2ff", selection_outline="#5945d9", stage="#dfe5f2",
+             shadow="#bbc6dc", good="#16734e", error="#a23546", guide="#8a581c", header="#17233c")
 
 
-def configure_style(root):
-    root.configure(background=BACKGROUND)
+def configure_style(root, dark):
+    colors = DARK if dark else LIGHT
+    c = colors
+    root.configure(background=c["background"])
+    for key, color in (("background", c["field"]), ("foreground", c["ink"]),
+                       ("selectBackground", c["selected"]), ("selectForeground", c["ink"])):
+        root.option_add(f"*TCombobox*Listbox.{key}", color)
     family = nametofont("TkDefaultFont", root=root).actual("family")
     style = ttk.Style(root)
     style.theme_use("clam")
-    style.configure(".", background=PANEL, foreground=INK, font=(family, 10))
-    style.configure("TFrame", background=PANEL)
-    style.configure("App.TFrame", background=BACKGROUND)
+    style.configure(".", background=c["panel"], foreground=c["ink"], font=(family, 10),
+                    bordercolor=c["line"], lightcolor=c["line"], darkcolor=c["line"],
+                    troughcolor=c["field"], arrowcolor=c["ink"], selectbackground=c["selected"],
+                    selectforeground=c["ink"], focuscolor=c["selection_outline"])
+    style.configure("TFrame", background=c["panel"])
+    style.configure("App.TFrame", background=c["background"])
     style.configure("TLabel", padding=0)
-    style.configure("Muted.TLabel", foreground=MUTED)
-    style.configure("App.TLabel", foreground=MUTED, background=BACKGROUND)
+    style.configure("Muted.TLabel", foreground=c["muted"])
+    style.configure("Error.TLabel", foreground=c["error"])
+    style.configure("App.TLabel", foreground=c["muted"], background=c["background"])
     style.configure("Title.TLabel", font=(family, 21, "bold"))
     style.configure("Section.TLabel", font=(family, 12, "bold"))
-    style.configure("Header.TFrame", background=INK)
-    style.configure("Header.TLabel", background=INK, foreground="#ffffff", font=(family, 20, "bold"))
-    style.configure("HeaderSub.TLabel", background=INK, foreground="#bdc9e4", font=(family, 8))
-    style.configure("TButton", background="#eef0f7", foreground=INK, padding=(9, 6), borderwidth=0)
-    style.map("TButton", background=[("pressed", "#dce1f3"), ("active", "#e1e6f6")],
-              foreground=[("disabled", "#8590a7")])
-    style.configure("Accent.TButton", background=ACCENT, foreground="white", padding=(12, 7))
-    style.map("Accent.TButton", background=[("disabled", "#d9d8ef"), ("active", ACCENT_HOVER)],
-              foreground=[("disabled", "#626580")])
-    style.configure("TEntry", fieldbackground="#f8f9fd", padding=(6, 5))
-    style.configure("TCombobox", fieldbackground="#f8f9fd", padding=(5, 4), arrowsize=14)
-    style.map("TCombobox", fieldbackground=[("readonly", "#f8f9fd")],
-              selectbackground=[("readonly", "#f8f9fd")], selectforeground=[("readonly", INK)])
-    style.configure("TNotebook", background=PANEL, borderwidth=0)
-    style.configure("TNotebook.Tab", padding=(12, 7), background="#eef0f7")
-    style.map("TNotebook.Tab", background=[("selected", PANEL)], foreground=[("selected", ACCENT)])
-    style.configure("Treeview", fieldbackground=PANEL, rowheight=28, borderwidth=0)
-    style.configure("Treeview.Heading", background="#eef0f7", padding=(5, 5))
-    style.map("Treeview", background=[("selected", "#e6e2ff")], foreground=[("selected", INK)])
-    style.configure("TProgressbar", background=ACCENT, troughcolor="#e8e6f7")
+    style.configure("Header.TFrame", background=c["header"])
+    style.configure("Header.TLabel", background=c["header"], foreground="#ffffff", font=(family, 20, "bold"))
+    style.configure("HeaderSub.TLabel", background=c["header"], foreground="#bdc9e4", font=(family, 8))
+    style.configure("TButton", background=c["raised"], padding=(8, 5), borderwidth=0)
+    style.configure("TMenubutton", background=c["raised"], padding=(8, 5))
+    for name in ("TButton", "TMenubutton", "TScrollbar"):
+        style.map(name, background=[("pressed", c["selected"]), ("active", c["hover"])],
+                  foreground=[("disabled", c["muted"])])
+    style.configure("Accent.TButton", background=c["accent"], foreground="white", padding=(12, 7))
+    style.map("Accent.TButton", background=[("disabled", c["raised"]), ("active", "#5845d6")],
+              foreground=[("disabled", c["muted"])])
+    style.configure("TEntry", fieldbackground=c["field"], insertcolor=c["ink"], padding=(6, 4))
+    style.configure("TCombobox", fieldbackground=c["field"], background=c["raised"],
+                    insertcolor=c["ink"], padding=(5, 4), arrowsize=14)
+    style.map("TCombobox", fieldbackground=[("readonly", c["field"])],
+              selectbackground=[("readonly", c["field"])], selectforeground=[("readonly", c["ink"])])
+    style.configure("TCheckbutton", indicatorbackground=c["field"], indicatorforeground=c["ink"])
+    style.map("TCheckbutton", indicatorbackground=[("selected", c["selected"])],
+              background=[("active", c["panel"])])
+    style.configure("TNotebook", background=c["panel"], borderwidth=0)
+    style.configure("TNotebook.Tab", padding=(9, 7), background=c["raised"])
+    style.map("TNotebook.Tab", background=[("selected", c["selected"]), ("active", c["hover"])],
+              foreground=[("selected", c["ink"])])
+    style.configure("Treeview", fieldbackground=c["field"], background=c["field"], rowheight=25, borderwidth=0)
+    style.configure("Treeview.Heading", background=c["raised"], padding=(5, 5))
+    style.map("Treeview.Heading", background=[("active", c["hover"])])
+    style.map("Treeview", background=[("selected", c["selected"])], foreground=[("selected", c["ink"])])
+    style.configure("TScrollbar", background=c["raised"])
+    style.configure("TProgressbar", background=c["accent"], troughcolor=c["field"])
+    return colors
 
 
 def button(parent, label, command, primary=False, **options):
@@ -58,8 +76,8 @@ def button(parent, label, command, primary=False, **options):
 
 def field(parent, label, variable, options=None, editable=False, width=12):
     row = ttk.Frame(parent)
-    row.pack(fill="x", pady=(0, 7))
-    ttk.Label(row, text=label, style="Muted.TLabel").pack(anchor="w", pady=(0, 3))
+    row.pack(fill="x", pady=(0, 5))
+    ttk.Label(row, text=label, style="Muted.TLabel").pack(anchor="w", pady=(0, 2))
     if options is None:
         control = ttk.Entry(row, textvariable=variable, width=width)
     else:
@@ -79,32 +97,6 @@ def tree_with_scroll(parent, columns, **kwargs):
     return frame, tree
 
 
-class ScrollPanel(ttk.Frame):
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.canvas = tk.Canvas(self, highlightthickness=0, background=PANEL, width=270)
-        scroll = ttk.Scrollbar(self, command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=scroll.set)
-        scroll.pack(side="right", fill="y")
-        self.canvas.pack(fill="both", expand=True)
-        self.content = ttk.Frame(self.canvas, padding=(6, 4, 9, 4))
-        window = self.canvas.create_window((0, 0), anchor="nw", window=self.content)
-        self.content.bind("<Configure>", lambda _: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.canvas.bind("<Configure>", lambda event: self.canvas.itemconfigure(window, width=event.width))
-        top = self.winfo_toplevel()
-        for key in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-            top.bind(key, self._wheel, add="+")
-
-    def _wheel(self, event):
-        target = self.winfo_containing(event.x_root, event.y_root)
-        if target is None or not str(target).startswith(str(self.content)):
-            return
-        if isinstance(target, (tk.Text, ttk.Combobox)):
-            return
-        step = -1 if (getattr(event, "num", 0) == 4 or event.delta > 0) else 1
-        self.canvas.yview_scroll(step * 3, "units")
-
-
 class BatchList(ttk.Frame):
     page_size = 150
 
@@ -118,8 +110,10 @@ class BatchList(ttk.Frame):
         self.caption = tk.StringVar(value="No batch")
         controls = ttk.Frame(self)
         controls.pack(fill="x", pady=(0, 6))
-        button(controls, "‹", lambda: self.show(self.start - self.page_size), width=3).pack(side="left")
-        button(controls, "›", lambda: self.show(self.start + self.page_size), width=3).pack(side="left", padx=(3, 8))
+        self.previous = button(controls, "‹", lambda: self.change_page(-1), width=3)
+        self.previous.pack(side="left")
+        self.next = button(controls, "›", lambda: self.change_page(1), width=3)
+        self.next.pack(side="left", padx=(3, 8))
         ttk.Label(controls, textvariable=self.caption, style="Muted.TLabel").pack(side="left")
         button(controls, "Go", self.jump, width=4).pack(side="right")
         go = ttk.Entry(controls, textvariable=self.number, width=7)
@@ -154,16 +148,24 @@ class BatchList(ttk.Frame):
         except ValueError:
             pass
 
+    def change_page(self, direction):
+        number = self.start + direction * self.page_size
+        self.show(number, focus=number)
+
     def show(self, start=None, focus=None):
         children = self.tree.get_children()
         if children:
             self.tree.delete(*children)
         if self.batch is None:
             self.caption.set("No batch")
+            self.previous.state(["disabled"])
+            self.next.state(["disabled"])
             return
         last_page = ((self.batch.count - 1) // self.page_size) * self.page_size + 1
         self.start = max(1, min(last_page, self.start if start is None else start))
         end = min(self.batch.count, self.start + self.page_size - 1)
+        self.previous.state(["!disabled" if self.start > 1 else "disabled"])
+        self.next.state(["!disabled" if end < self.batch.count else "disabled"])
         self.caption.set(f"{self.start:,}–{end:,} of {self.batch.count:,}")
         for number in range(self.start, end + 1):
             try:

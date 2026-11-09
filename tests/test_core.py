@@ -7,6 +7,7 @@ from unittest.mock import patch
 from PIL import Image
 from openpyxl import Workbook
 
+from stupid_print import placement
 from stupid_print.model import (Batch, Library, Selection, element, excel_sheets, import_data,
                                 new_document, read_document)
 from stupid_print.printer import D30, PRINT_COMPLETE, PrinterStatus
@@ -120,6 +121,49 @@ class RenderTests(unittest.TestCase):
             render_label(doc, Batch(doc), 0)
         item["compact"] = True
         self.assertGreater(render_label(doc, Batch(doc), 0).histogram()[0], 0)
+
+    def test_barcode_keeps_white_modules_and_quiet_zones_over_a_lower_layer(self):
+        doc = new_document()
+        code = element("barcode", x=2, y=3, w=34, h=6, value="007")
+        doc["elements"] = [element("line", x=0, y=4, w=40, h=1), code]
+        composite = render_label(doc, Batch(doc), 0)
+        doc["elements"] = [code]
+        alone = render_label(doc, Batch(doc), 0)
+        scan_region = (16, 24, 288, 72)
+        self.assertEqual(composite.crop(scan_region).tobytes(), alone.crop(scan_region).tobytes())
+        self.assertEqual(composite.getpixel((0, 35)), 0)
+
+
+class PlacementTests(unittest.TestCase):
+    def test_single_alignment_respects_wide_stock_printable_area(self):
+        doc = new_document()
+        doc["height"] = 15
+        item = element("text", w=10, h=3)
+        placement.align([item], doc, 1, 0)
+        self.assertEqual(item["y"], 1.5)
+        placement.align([item], doc, 1, 1)
+        self.assertEqual(item["y"], 10.5)
+
+    def test_group_aligns_as_block_or_aligns_members(self):
+        doc = new_document()
+        items = [element("text", x=3, y=2, w=10), element("image", x=15, y=1, w=4)]
+        placement.align(items, doc, 0, .5, to_label=True)
+        self.assertEqual([item["x"] for item in items], [12, 24])
+        placement.align(items, doc, 0, 1)
+        self.assertEqual([item["x"] for item in items], [18, 24])
+
+    def test_distribution_uses_equal_gaps_and_keeps_outer_edges(self):
+        items = [element("text", x=1, w=4), element("text", x=6, w=3), element("text", x=17, w=5)]
+        placement.distribute(items, 0)
+        self.assertEqual([item["x"] for item in items], [1, 9.5, 17])
+        with self.assertRaisesRegex(ValueError, "at least three"):
+            placement.distribute(items[:2], 0)
+
+    def test_snap_and_clamping_preserve_group_spacing(self):
+        items = [element("text", x=2.2, y=2.4, w=5, h=2),
+                 element("image", x=8.2, y=5.4, w=8, h=4)]
+        placement.move(items, placement.bounds(items), 2.4, 12, (40, 12), snap=True)
+        self.assertEqual([(item["x"], item["y"]) for item in items], [(5, 5), (11, 8)])
 
 
 class PrinterTests(unittest.TestCase):

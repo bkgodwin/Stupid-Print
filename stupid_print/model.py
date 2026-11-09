@@ -110,7 +110,7 @@ def read_document(path):
 
 def _validate_element(item, used):
     uid = item["id"]
-    if not isinstance(uid, str) or uid in used:
+    if not isinstance(uid, str) or not uid or uid in used:
         raise ValueError("Invalid element identifier.")
     used.add(uid)
     for key, low, high in (("x", 0, 200), ("y", 0, 15), ("w", 0.2, 200), ("h", 0.2, 15)):

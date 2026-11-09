@@ -11,15 +11,31 @@ from PIL import Image, ImageTk
 from .model import Batch, Selection
 from .printer import D30
 from .render import raster_packet, render_label
-from .widgets import BatchList, PREVIEW, button, field
+from .widgets import BatchList, button, field
 
 
-class ChoiceDialog(simpledialog.Dialog):
+class SettingsDialog(simpledialog.Dialog):
+    def buttonbox(self):
+        panel = ttk.Frame(self, padding=(12, 4, 12, 10))
+        panel.pack(fill="x")
+        button(panel, "OK", self.ok, primary=True).pack(side="right")
+        button(panel, "Cancel", self.cancel).pack(side="right", padx=(0, 6))
+        self.bind("<Return>", self.ok)
+        self.bind("<Escape>", self.cancel)
+
+    def body(self, parent):
+        background = ttk.Style(self).lookup("TFrame", "background")
+        self.configure(background=background)
+        parent.configure(background=background, padx=12, pady=6)
+
+
+class ChoiceDialog(SettingsDialog):
     def __init__(self, parent, title, options):
         self.options = options
         super().__init__(parent, title)
 
     def body(self, parent):
+        super().body(parent)
         self.variable = tk.StringVar(value=self.options[0])
         return field(parent, "Worksheet", self.variable, self.options, width=35)
 
@@ -27,13 +43,13 @@ class ChoiceDialog(simpledialog.Dialog):
         self.result = self.variable.get()
 
 
-class BatchSetup(simpledialog.Dialog):
+class BatchSetup(SettingsDialog):
     def __init__(self, parent, doc):
         self.doc = doc
         super().__init__(parent, "Batch setup")
 
     def body(self, parent):
-        parent.configure(padx=14, pady=8)
+        super().body(parent)
         self.variables = {key: tk.StringVar(value=value) for key, value in self.doc["batch"].items()}
         first = field(parent, "Labels to generate (0 = all imported rows)", self.variables["count"])
         columns = ttk.Frame(parent)
@@ -52,7 +68,7 @@ class BatchSetup(simpledialog.Dialog):
                   "{{serial}} · {{ip}} · {{subnet}} · {{cidr}} · {{index}}",
                   style="Muted.TLabel").pack(anchor="w", pady=8)
         self.error = tk.StringVar()
-        ttk.Label(parent, textvariable=self.error, foreground="#a23546", wraplength=440).pack(fill="x")
+        ttk.Label(parent, textvariable=self.error, style="Error.TLabel", wraplength=440).pack(fill="x")
         return first
 
     def validate(self):
@@ -86,7 +102,7 @@ class PrintDialog(tk.Toplevel):
         y = app.root.winfo_rooty() + (app.root.winfo_height() - height) // 2
         self.geometry(f"{width}x{height}+{max(0, x)}+{max(0, y)}")
         self.minsize(570, 530)
-        self.configure(background=PREVIEW)
+        self.configure(background=app.colors["panel"])
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.bind("<Escape>", lambda _: self.close())
         body = ttk.Frame(self, padding=17)

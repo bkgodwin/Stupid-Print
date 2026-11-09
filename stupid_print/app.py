@@ -13,10 +13,10 @@ from PIL import Image, ImageTk
 from .dialogs import BatchSetup, ChoiceDialog, PrintDialog
 from .model import (EXTENSION, PRESETS, Batch, Library, dimensions, element, excel_sheets,
                     import_data, new_document, read_document, write_json)
+from . import placement
 from .printer import D30, available_ports, suggested_port
-from .render import BARCODES, EMOJIS, embed_image, font_catalog, render_label
-from .widgets import (ACCENT, ERROR, GOOD, INK, MUTED, PREVIEW, BatchList, ScrollPanel,
-                      button, configure_style, field, tree_with_scroll)
+from .render import BARCODES, DPI, EMOJIS, embed_image, font_catalog, render_label
+from .widgets import BatchList, button, configure_style, field, tree_with_scroll
 
 
 class App:
@@ -30,11 +30,13 @@ class App:
         self.render_timer = None
         self.batch = None
         self.preview_number = 1
-        self.selected = self.doc["elements"][0]["id"]
+        self.selected = []
         self.photo = None
         self.bounds = None
         self.drag = None
+        self.editor_text = None
         self.printer_busy = False
+        self.printer_tone = "muted"
         self.status_events = queue.SimpleQueue()
         self.port = tk.StringVar(value=self.settings.get("port", ""))
         self.printer_title = tk.StringVar(value="Printer status")
@@ -44,9 +46,15 @@ class App:
         self.preview_note = tk.StringVar()
         self.footer = tk.StringVar(value="Ready to design")
         self.data_note = tk.StringVar()
+        self.theme_label = tk.StringVar()
+        self.batch_visible = tk.BooleanVar(value=True)
+        self.grid_visible = tk.BooleanVar(value=bool(self.settings.get("grid", False)))
+        self.snap_grid = tk.BooleanVar(value=bool(self.settings.get("snap", False)))
+        self.align_reference = tk.StringVar(value="Selection")
         self.library_paths = {}
         self.library_names = {}
-        configure_style(root)
+        self.dark = self.settings.get("theme") != "light"
+        self.colors = configure_style(root, self.dark)
         root.title("Stupid Print — Label Studio")
         root.geometry("1300x850")
         root.minsize(1060, 700)
@@ -55,6 +63,7 @@ class App:
         root.bind("<Control-n>", lambda _: self.new_project())
         root.bind("<Control-p>", lambda _: self.open_print())
         self.build()
+        self.apply_theme()
         self.update_library()
         previous = next((path for path in self.library_paths.values()
                          if path.stem == self.settings.get("last")), None)
@@ -69,7 +78,7 @@ class App:
     def build(self):
         header = ttk.Frame(self.root, style="Header.TFrame", padding=(19, 12))
         header.pack(fill="x")
-        brand = tk.Canvas(header, width=43, height=43, highlightthickness=0, background=INK)
+        brand = self.brand = tk.Canvas(header, width=43, height=43, highlightthickness=0)
         brand.pack(side="left", padx=(0, 11))
         brand.create_rectangle(1, 1, 42, 42, fill="#7665fb", outline="")
         brand.create_polygon(10, 12, 26, 12, 34, 21, 26, 31, 10, 31, fill="white")
@@ -83,6 +92,7 @@ class App:
         button(header, "Print batch…", self.open_print, primary=True).pack(side="right")
         button(header, "Save", self.save).pack(side="right", padx=8)
         button(header, "New label", self.new_project).pack(side="right")
+        ttk.Button(header, textvariable=self.theme_label, command=self.toggle_theme).pack(side="right", padx=8)
 
         main = ttk.Frame(self.root, style="App.TFrame", padding=(13, 13, 13, 0))
         main.pack(fill="both", expand=True)
@@ -114,9 +124,15 @@ class App:
         actions.pack(fill="x", pady=6)
         button(actions, "Open", self.open_saved).pack(side="left")
         button(actions, "Use as copy", lambda: self.open_saved(True)).pack(side="left", padx=5)
-        button(parent, "Open .stupidprint file…", self.open_file).pack(fill="x", pady=(1, 2))
-        button(parent, "Save as template…", self.save_template).pack(fill="x", pady=2)
-        button(parent, "Export project file…", self.export_project).pack(fill="x", pady=2)
+        project = ttk.Menubutton(parent, text="Project files")
+        self.project_menu = tk.Menu(project, tearoff=False)
+        for label, command in (("Open .stupidprint file…", self.open_file),
+                               ("Save as template…", self.save_template),
+                               ("Export project file…", self.export_project),
+                               ("Export current label PNG…", self.export_image)):
+            self.project_menu.add_command(label=label, command=command)
+        project.configure(menu=self.project_menu)
+        project.pack(fill="x", pady=(0, 3))
 
         ttk.Separator(parent).pack(fill="x", pady=12)
         self.printer_badge = ttk.Label(parent, textvariable=self.printer_title, style="Section.TLabel")
@@ -140,13 +156,15 @@ class App:
                              ("+ Barcode", lambda: self.add_item("barcode")),
                              ("+ Image", self.add_image), ("+ Rule", lambda: self.add_item("line"))):
             button(toolbar, name, action).pack(side="left", padx=(0, 4))
-        button(toolbar, "Export PNG", self.export_image).pack(side="right")
-        self.canvas = tk.Canvas(parent, background=PREVIEW, highlightthickness=0, height=246)
+        self.canvas = tk.Canvas(parent, highlightthickness=0, height=188, takefocus=True)
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", lambda _: self.draw_stage())
         self.canvas.bind("<ButtonPress-1>", self.canvas_press)
         self.canvas.bind("<B1-Motion>", self.canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self.canvas_release)
+        self.canvas.bind("<KeyPress>", self.canvas_key)
+        self.canvas.bind("<Control-a>", lambda _: self.select_all())
+        self.canvas.bind("<Control-d>", lambda _: self.duplicate_item() or "break")
         ttk.Label(parent, textvariable=self.preview_note, style="Muted.TLabel", wraplength=530).pack(
             anchor="w", pady=(5, 8))
         ttk.Separator(parent).pack(fill="x", pady=(0, 8))
@@ -154,19 +172,72 @@ class App:
         row.pack(fill="x", pady=(0, 5))
         ttk.Label(row, text="Batch preview", style="Section.TLabel").pack(side="left")
         button(row, "Batch setup…", self.setup_batch).pack(side="right")
-        button(row, "Import CSV / Excel…", self.import_source).pack(side="right", padx=6)
-        ttk.Label(parent, textvariable=self.data_note, style="Muted.TLabel").pack(anchor="w", pady=(0, 5))
-        self.batch_list = BatchList(parent, self.select_batch)
+        button(row, "Import data…", self.import_source).pack(side="right", padx=6)
+        self.batch_toggle = button(row, "Hide", self.toggle_batch, width=5)
+        self.batch_toggle.pack(side="left", padx=8)
+        self.batch_body = ttk.Frame(parent)
+        self.batch_body.pack(fill="x")
+        ttk.Label(self.batch_body, textvariable=self.data_note, wraplength=435, style="Muted.TLabel").pack(
+            anchor="w", pady=(0, 5))
+        self.batch_list = BatchList(self.batch_body, self.select_batch)
         self.batch_list.pack(fill="x")
 
     def build_inspector(self, parent):
-        ttk.Label(parent, text="Inspector", style="Section.TLabel", padding=(5, 2, 0, 8)).pack(anchor="w")
+        ttk.Label(parent, text="Layers", style="Section.TLabel", padding=(5, 2, 0, 7)).pack(anchor="w")
+        frame, self.layer_tree = tree_with_scroll(parent, ("layer",), height=4, selectmode="extended")
+        self.layer_tree.configure(show="")
+        self.layer_tree.column("layer", width=270)
+        self.layer_tree.bind("<<TreeviewSelect>>", self.select_from_tree)
+        self.layer_tree.bind("<Delete>", lambda _: self.remove_item() or "break")
+        frame.pack(fill="x")
+        actions = ttk.Frame(parent)
+        actions.pack(fill="x", pady=(6, 8))
+        for label, action, width in (("Duplicate", self.duplicate_item, 8), ("Remove", self.remove_item, 7),
+                                     ("Raise", lambda: self.reorder(1), 5),
+                                     ("Lower", lambda: self.reorder(-1), 5)):
+            button(actions, label, action, width=width).pack(side="left", padx=(0, 4))
         self.tabs = ttk.Notebook(parent)
         self.tabs.pack(fill="both", expand=True)
-        self.item_panel = ScrollPanel(self.tabs)
-        self.page_panel = ScrollPanel(self.tabs)
-        self.tabs.add(self.item_panel, text="Elements")
-        self.tabs.add(self.page_panel, text="Label")
+        self.item_panel = ttk.Frame(self.tabs, padding=9)
+        self.style_panel = ttk.Frame(self.tabs, padding=9)
+        self.place_panel = ttk.Frame(self.tabs, padding=9)
+        self.page_panel = ttk.Frame(self.tabs, padding=9)
+        for panel, title in ((self.item_panel, "Content"), (self.style_panel, "Style"),
+                             (self.place_panel, "Place"), (self.page_panel, "Label")):
+            self.tabs.add(panel, text=title)
+
+    def toggle_theme(self):
+        self.dark = not self.dark
+        self.settings["theme"] = "dark" if self.dark else "light"
+        self.persist_settings()
+        self.apply_theme()
+
+    def apply_theme(self):
+        self.colors = c = configure_style(self.root, self.dark)
+        self.theme_label.set("Light mode" if self.dark else "Dark mode")
+        self.brand.configure(background=c["header"])
+        self.canvas.configure(background=c["stage"])
+        self.project_menu.configure(background=c["panel"], foreground=c["ink"],
+                                    activebackground=c["selected"], activeforeground=c["ink"])
+        self.printer_badge.configure(foreground=c[self.printer_tone])
+        if self.editor_text is not None:
+            self.style_text(self.editor_text)
+        self.draw_stage()
+
+    def style_text(self, text):
+        c = self.colors
+        text.configure(background=c["field"], foreground=c["ink"], insertbackground=c["ink"],
+                       selectbackground=c["selected"], selectforeground=c["ink"],
+                       highlightbackground=c["line"], highlightcolor=c["selection_outline"])
+
+    def toggle_batch(self):
+        visible = not self.batch_visible.get()
+        self.batch_visible.set(visible)
+        if visible:
+            self.batch_body.pack(fill="x")
+        else:
+            self.batch_body.pack_forget()
+        self.batch_toggle.configure(text="Hide" if visible else "Show")
 
     def update_library(self):
         selected = self.library_tree.selection()
@@ -215,7 +286,8 @@ class App:
             self.printer_detail.set("Choose or enter a Bluetooth serial port.")
             return
         self.printer_busy = True
-        self.printer_badge.configure(foreground=MUTED)
+        self.printer_tone = "muted"
+        self.printer_badge.configure(foreground=self.colors[self.printer_tone])
         self.printer_title.set("Checking printer…")
         self.printer_detail.set(port)
         self.settings["port"] = port
@@ -226,8 +298,9 @@ class App:
                 with D30(port) as printer:
                     status = printer.status()
                 self.status_events.put((not status.issue, status.description))
-            except (OSError, ValueError) as exc:
-                self.status_events.put((False, str(exc)))
+            except (OSError, ValueError):
+                self.status_events.put((False, f"Could not reach {port}. Check printer power, "
+                                               "Bluetooth pairing, and serial-port access."))
 
         threading.Thread(target=check, daemon=True).start()
         self.root.after(100, self.poll_status)
@@ -240,7 +313,8 @@ class App:
             return
         self.printer_busy = False
         self.printer_title.set("Printer ready" if ready else "Printer attention")
-        self.printer_badge.configure(foreground=GOOD if ready else ERROR)
+        self.printer_tone = "good" if ready else "error"
+        self.printer_badge.configure(foreground=self.colors[self.printer_tone])
         self.printer_detail.set(details)
 
     def persist_settings(self):
@@ -354,7 +428,7 @@ class App:
                                             filetypes=[("PNG image", "*.png")])
         if path:
             try:
-                image.save(path, dpi=(203, 203))
+                image.save(path, dpi=(DPI, DPI))
                 self.footer.set(f"Exported · {Path(path).name}")
             except OSError as exc:
                 messagebox.showerror("Export preview", str(exc), parent=self.root)
@@ -421,7 +495,7 @@ class App:
 
     def load_editor(self):
         self.preview_number = 1
-        self.selected = next((item["id"] for item in self.doc["elements"]), None)
+        self.selected = [item["id"] for item in self.doc["elements"][:1]]
         self.rebuild_elements()
         self.rebuild_page()
         self.refresh()
@@ -439,83 +513,140 @@ class App:
         x, y = (stage_width - w) // 2, (stage_height - h) // 2
         self.bounds = (x, y, factor)
         canvas.delete("all")
-        for dot_y in range(12, stage_height, 19):
-            for dot_x in range(12, stage_width, 19):
-                canvas.create_rectangle(dot_x, dot_y, dot_x + 1, dot_y + 1, fill="#c9d3e8", outline="")
-        canvas.create_rectangle(x + 4, y + 5, x + w + 4, y + h + 5, fill="#c0cbe2", outline="")
+        canvas.create_rectangle(x + 5, y + 6, x + w + 5, y + h + 6, fill=self.colors["shadow"], outline="")
         canvas.create_rectangle(x, y, x + w, y + h, fill="white", outline="")
         try:
             batch = self.batch or Batch(self.doc)
             image = render_label(self.doc, batch, self.preview_number - 1)
             self.photo = ImageTk.PhotoImage(image.resize((w, h), Image.Resampling.NEAREST), master=self.root)
             canvas.create_image(x, y, image=self.photo, anchor="nw")
-            self.preview_note.set(f"Label {self.preview_number:,} of {batch.count:,} · Drag to move, corner to resize")
+            self.preview_note.set(f"Label {self.preview_number:,} of {batch.count:,}  ·  {DPI} dpi  ·  "
+                                  "Shift-click to select more")
         except (OSError, ValueError, TypeError, KeyError, IndexError) as exc:
             self.preview_note.set(str(exc))
-        if height > 12:
-            outside = (height - 12) * factor / 2
-            for edge in (y + outside, y + h - outside):
-                canvas.create_line(x, edge, x + w, edge, fill="#a97932", dash=(3, 3))
-        item = self.item()
-        if item:
+        if self.grid_visible.get():
+            for column in range(1, int(width)):
+                px = x + column * factor
+                canvas.create_line(px, y, px, y + h, fill="#c6cfe3", stipple="gray25")
+            for row in range(1, int(height)):
+                py = y + row * factor
+                canvas.create_line(x, py, x + w, py, fill="#c6cfe3", stipple="gray25")
+        _, top, _, bottom = placement.printable_area(self.doc)
+        if top:
+            for edge in (y + top * factor, y + bottom * factor):
+                canvas.create_line(x, edge, x + w, edge, fill=self.colors["guide"], dash=(4, 3))
+        items = self.items()
+        outline = self.colors["selection_outline"]
+        for item in items:
             left, top = x + item["x"] * factor, y + item["y"] * factor
             right, bottom = left + item["w"] * factor, top + item["h"] * factor
-            canvas.create_rectangle(left, top, right, bottom, outline=ACCENT, width=1, dash=(4, 3))
-            canvas.create_rectangle(right - 4, bottom - 4, right + 4, bottom + 4, fill=ACCENT, outline="white")
+            canvas.create_rectangle(left, top, right, bottom, outline=outline, width=2, dash=(4, 3))
+            if len(items) == 1:
+                canvas.create_rectangle(right - 4, bottom - 4, right + 4, bottom + 4,
+                                        fill=outline, outline="white")
 
     def canvas_press(self, event):
         if not self.bounds:
             return
+        self.canvas.focus_set()
         origin_x, origin_y, scale = self.bounds
         px, py = (event.x - origin_x) / scale, (event.y - origin_y) / scale
         item = self.item()
-        if item and abs(px - item["x"] - item["w"]) <= 8 / scale and abs(py - item["y"] - item["h"]) <= 8 / scale:
-            self.drag = ("resize", event.x, event.y, item["w"], item["h"])
+        extended = bool(event.state & (0x0001 | 0x0004))
+        if item and not extended and abs(px - item["x"] - item["w"]) <= 8 / scale and (
+            abs(py - item["y"] - item["h"]) <= 8 / scale
+        ):
+            self.drag = ("resize", event.x, event.y, [(item, "w", item["w"], "h", item["h"])])
             return
         for candidate in reversed(self.doc["elements"]):
             if candidate["x"] <= px <= candidate["x"] + candidate["w"] and (
                 candidate["y"] <= py <= candidate["y"] + candidate["h"]
             ):
-                self.selected = candidate["id"]
-                self.drag = ("move", event.x, event.y, candidate["x"], candidate["y"])
-                self.rebuild_elements()
-                self.tabs.select(self.item_panel)
-                self.draw_stage()
+                uid = candidate["id"]
+                if extended:
+                    self.select([key for key in self.selected if key != uid] if uid in self.selected else
+                                [*self.selected, uid])
+                elif uid not in self.selected:
+                    self.select([uid])
+                if uid in self.selected:
+                    self.drag = ("move", event.x, event.y, [(layer, "x", layer["x"], "y", layer["y"])
+                                                           for layer in self.items()])
                 return
+        if not extended:
+            self.select([])
 
     def canvas_drag(self, event):
         if not self.drag or not self.bounds:
             return
-        mode, x, y, a, b = self.drag
+        mode, x, y, originals = self.drag
         scale = self.bounds[2]
-        item = self.item()
-        width, height = dimensions(self.doc)
-        new_x, new_y = a + (event.x - x) / scale, b + (event.y - y) / scale
+        page = dimensions(self.doc)
+        dx, dy = (event.x - x) / scale, (event.y - y) / scale
+        for item, first, a, second, b in originals:
+            item[first], item[second] = a, b
         if mode == "move":
-            item["x"] = round(max(0, min(width - item["w"], new_x)), 2)
-            item["y"] = round(max(0, min(height - item["h"], new_y)), 2)
+            items = [record[0] for record in originals]
+            placement.move(items, placement.bounds(items), dx, dy, page, self.snap_grid.get())
         else:
-            item["w"] = round(max(0.2, min(width - item["x"], new_x)), 2)
-            item["h"] = round(max(0.2, min(height - item["y"], new_y)), 2)
+            w, h = item["w"] + dx, item["h"] + dy
+            if self.snap_grid.get():
+                w, h = round(item["x"] + w) - item["x"], round(item["y"] + h) - item["y"]
+            item["w"] = round(max(0.2, min(page[0] - item["x"], w)), 3)
+            item["h"] = round(max(0.2, min(page[1] - item["y"], h)), 3)
         self.draw_stage()
 
-    def canvas_release(self, event):
+    def canvas_release(self, _):
         if self.drag:
-            _, x, y, _, _ = self.drag
+            originals = self.drag[3]
             self.drag = None
-            if (x, y) != (event.x, event.y):
-                self.rebuild_elements()
-                self.changed()
+            if any(item[first] != a or item[second] != b for item, first, a, second, b in originals):
+                self.placement_changed()
+
+    def canvas_key(self, event):
+        directions = {"Left": (-1, 0), "Right": (1, 0), "Up": (0, -1), "Down": (0, 1)}
+        if event.keysym == "Delete":
+            self.remove_item()
+            return "break"
+        items = self.items()
+        if event.keysym in directions and items:
+            step = 1 if event.state & 0x0001 else placement.DOT
+            dx, dy = directions[event.keysym]
+            placement.move(items, placement.bounds(items), dx * step, dy * step, dimensions(self.doc))
+            self.placement_changed()
+            return "break"
+
+    def items(self):
+        selected = set(self.selected)
+        return [item for item in self.doc["elements"] if item["id"] in selected]
 
     def item(self):
-        return next((item for item in self.doc["elements"] if item["id"] == self.selected), None)
+        items = self.items()
+        return items[0] if len(items) == 1 else None
+
+    def select(self, ids, sync_layers=True):
+        if set(ids) != set(self.selected):
+            self.selected = ids
+            self.rebuild_elements(sync_layers=sync_layers)
+            self.draw_stage()
+
+    def select_all(self):
+        self.select([item["id"] for item in self.doc["elements"]])
+        return "break"
+
+    def select_from_tree(self, _):
+        self.select(list(self.layer_tree.selection()), sync_layers=False)
 
     def add_item(self, kind, **values):
-        w, h = dimensions(self.doc)
-        item = element(kind, w=w - 4, h=min(h - 2, 1 if kind == "line" else 8),
-                       y=min(2, (h - 1) / 2), **values)
+        w, _ = dimensions(self.doc)
+        _, top, _, bottom = placement.printable_area(self.doc)
+        height = min(bottom - top - 1, {"text": 4, "line": .25}.get(kind, 8))
+        width = min(w - 2, 10) if kind == "image" else w - 2
+        previous = self.item()
+        below = previous["y"] + previous["h"] + .5 if previous else top + 1
+        y = below if below + height <= bottom else top + .5
+        item = element(kind, x=1, y=y, w=width, h=height, **values)
         self.doc["elements"].append(item)
-        self.selected = item["id"]
+        self.selected = [item["id"]]
         self.tabs.select(self.item_panel)
         self.rebuild_elements()
         self.changed()
@@ -537,44 +668,74 @@ class App:
             messagebox.showerror("Import image", str(exc), parent=self.root)
 
     def duplicate_item(self):
-        source = self.item()
-        if source:
-            item = {**source, "id": uuid4().hex}
-            self.doc["elements"].append(item)
-            self.selected = item["id"]
+        copies = [{**source, "id": uuid4().hex} for source in self.items()]
+        if copies:
+            placement.move(copies, placement.bounds(copies), 1, 1, dimensions(self.doc))
+            self.doc["elements"].extend(copies)
+            self.selected = [item["id"] for item in copies]
             self.rebuild_elements()
             self.changed()
 
     def remove_item(self):
-        item = self.item()
-        if item:
-            self.doc["elements"].remove(item)
-            self.selected = next((item["id"] for item in reversed(self.doc["elements"])), None)
+        if self.selected:
+            selected = set(self.selected)
+            self.doc["elements"] = [item for item in self.doc["elements"] if item["id"] not in selected]
+            self.selected = []
             self.rebuild_elements()
             self.changed()
 
-    def rebuild_elements(self):
-        parent = self.item_panel.content
-        for child in parent.winfo_children():
-            child.destroy()
+    def reorder(self, direction):
         elements = self.doc["elements"]
+        selected = set(self.selected)
+        indices = range(len(elements) - 2, -1, -1) if direction == 1 else range(1, len(elements))
+        changed = False
+        for index in indices:
+            target = index + direction
+            if elements[index]["id"] in selected and elements[target]["id"] not in selected:
+                elements[index], elements[target] = elements[target], elements[index]
+                changed = True
+        if changed:
+            self.rebuild_elements()
+            self.changed()
+
+    @staticmethod
+    def layer_title(item):
+        name = item.get("value") or item.get("filename") or ""
+        summary = " ".join(name.split())
+        if len(summary) > 30:
+            summary = summary[:29] + "…"
+        return f"{item['kind'].title()}   {summary}".strip()
+
+    def rebuild_elements(self, sync_layers=True):
+        if sync_layers:
+            self.layer_tree.delete(*self.layer_tree.get_children())
+            for layer in reversed(self.doc["elements"]):
+                self.layer_tree.insert("", "end", iid=layer["id"], values=(self.layer_title(layer),))
+            self.layer_tree.selection_set(self.selected)
+            if self.selected:
+                self.layer_tree.see(self.selected[-1])
+        self.editor_text = None
+        for parent in (self.item_panel, self.style_panel):
+            for child in parent.winfo_children():
+                child.destroy()
+        self.rebuild_placement()
+        parent = self.item_panel
         item = self.item()
-        if not elements:
-            ttk.Label(parent, text="Add a text, barcode, image or rule.", wraplength=235).pack(anchor="w")
-            return
-        layers = {f"{index}  {layer['kind'].title()}": layer["id"]
-                  for index, layer in enumerate(elements, 1)}
-        layer = tk.StringVar(value=next((key for key, uid in layers.items() if uid == self.selected), ""))
-        control = field(parent, "Element", layer, tuple(layers))
-        control.bind("<<ComboboxSelected>>", lambda _: self.select_layer(layers[layer.get()]))
-        actions = ttk.Frame(parent)
-        actions.pack(fill="x", pady=(0, 7))
-        button(actions, "Duplicate", self.duplicate_item).pack(side="left")
-        button(actions, "Remove", self.remove_item).pack(side="left", padx=4)
         if item is None:
+            hint = ("Use Place to align or space the selection." if self.selected else
+                    "Select an element on the label, or add one from the toolbar.")
+            for panel in (parent, self.style_panel):
+                ttk.Label(panel, text=hint, wraplength=245, style="Muted.TLabel").pack(anchor="w")
             return
         if item["kind"] in ("text", "barcode"):
             self.content_controls(parent, item)
+        elif item["kind"] == "image":
+            ttk.Label(parent, text=item["filename"], wraplength=235).pack(anchor="w")
+            button(parent, "Replace image…", lambda: self.add_image(True)).pack(anchor="w", pady=6)
+        else:
+            ttk.Label(parent, text="Use Place to position and size this rule.",
+                      wraplength=245, style="Muted.TLabel").pack(anchor="w")
+        parent = self.style_panel
         if item["kind"] == "text":
             families = ("Default", *sorted(font_catalog(), key=str.casefold))
             self.item_field(parent, item, "font", "Font family", families)
@@ -592,32 +753,113 @@ class App:
             self.check_item(parent, item, "compact", "Allow compact bars (1 dot)")
             ttk.Label(parent, text="Use wider bars for easier scanning.", style="Muted.TLabel").pack(anchor="w")
         elif item["kind"] == "image":
-            ttk.Label(parent, text=item["filename"], wraplength=220).pack(anchor="w")
-            button(parent, "Replace image…", lambda: self.add_image(True)).pack(anchor="w", pady=6)
             self.check_item(parent, item, "dither", "Dither image")
-        ttk.Separator(parent).pack(fill="x", pady=8)
-        ttk.Label(parent, text="Position and size · mm", style="Muted.TLabel").pack(anchor="w")
-        width, height = dimensions(self.doc)
-        for keys in ((("x", "Left", 0, width), ("y", "Top", 0, height)),
-                     (("w", "Length", 0.2, width), ("h", "Height", 0.2, height))):
+            ttk.Label(parent, text="Dither photos for tonal detail. Turn it off for solid logos.",
+                      wraplength=235, style="Muted.TLabel").pack(anchor="w", pady=5)
+
+    def rebuild_placement(self):
+        parent = self.place_panel
+        for child in parent.winfo_children():
+            child.destroy()
+        options = ttk.Frame(parent)
+        options.pack(fill="x", pady=(0, 6))
+        ttk.Checkbutton(options, text="1 mm grid", variable=self.grid_visible,
+                        command=self.placement_settings).pack(side="left", padx=(0, 8))
+        ttk.Checkbutton(options, text="Snap", variable=self.snap_grid,
+                        command=self.placement_settings).pack(side="left")
+        count = len(self.selected)
+        item = self.item()
+        self.geometry_fields = {}
+        if item:
+            for group in ((("x", "Left · mm"), ("y", "Top · mm")),
+                          (("w", "Length · mm"), ("h", "Height · mm"))):
+                row = ttk.Frame(parent)
+                row.pack(fill="x")
+                for key, title in group:
+                    column = ttk.Frame(row)
+                    column.pack(side="left", fill="x", expand=True, padx=(0, 5))
+                    variable = self.geometry_fields[key] = tk.StringVar(value=f"{item[key]:g}")
+                    control = field(column, title, variable, width=7)
+                    control.bind("<Return>", lambda _, k=key: self.commit_geometry(item, k))
+                    control.bind("<FocusOut>", lambda _, k=key: self.commit_geometry(item, k))
+        if not count:
+            ttk.Label(parent, text="Select elements to place or align.", style="Muted.TLabel").pack(anchor="w")
+            return
+        ttk.Separator(parent).pack(fill="x", pady=(4, 8))
+        if count > 1:
+            field(parent, "Align to", self.align_reference, ("Selection", "Printable area"))
+        else:
+            ttk.Label(parent, text="Align to printable area", style="Muted.TLabel").pack(anchor="w", pady=(0, 4))
+        for axis, labels in enumerate((("Left", "Center", "Right"), ("Top", "Middle", "Bottom"))):
+            row = ttk.Frame(parent)
+            row.pack(fill="x", pady=(0, 4))
+            for anchor, name in zip((0, .5, 1), labels):
+                button(row, name, lambda a=axis, p=anchor: self.align_selection(a, p),
+                       width=7).pack(side="left", fill="x", expand=True, padx=(0, 4))
+        if count > 1:
             row = ttk.Frame(parent)
             row.pack(fill="x", pady=(4, 0))
-            for key, label, low, high in keys:
-                group = ttk.Frame(row)
-                group.pack(side="left", fill="x", expand=True, padx=(0, 4))
-                self.item_field(group, item, key, label, numeric=(low, high), width=6)
+            for axis, name in enumerate(("Space across", "Space down")):
+                control = button(row, name, lambda a=axis: self.distribute_selection(a))
+                control.pack(side="left", fill="x", expand=True, padx=(0, 4))
+                if count < 3:
+                    control.state(["disabled"])
+        ttk.Label(parent, text="On the canvas, arrows move one dot. Shift + arrow moves 1 mm.",
+                  wraplength=245, style="Muted.TLabel").pack(anchor="w", pady=(9, 0))
 
-    def select_layer(self, uid):
-        self.selected = uid
-        self.rebuild_elements()
+    def commit_geometry(self, item, key):
+        if self.item() is not item or key not in self.geometry_fields:
+            return
+        previous = tuple(item[k] for k in self.geometry_fields)
+        try:
+            value = float(self.geometry_fields[key].get())
+        except ValueError:
+            value = item[key]
+        if (0 if key in ("x", "y") else .2) <= value <= 200:
+            item[key] = round(value, 3)
+            placement.fit_box(item, dimensions(self.doc))
+        if previous != tuple(item[k] for k in self.geometry_fields):
+            self.placement_changed()
+        else:
+            self.update_geometry_fields()
+
+    def update_geometry_fields(self):
+        item = self.item()
+        if item:
+            for key, variable in self.geometry_fields.items():
+                variable.set(f"{item[key]:g}")
+
+    def placement_changed(self):
+        self.update_geometry_fields()
+        self.changed()
+        self.draw_stage()
+
+    def align_selection(self, axis, anchor):
+        items = self.items()
+        if items:
+            placement.align(items, self.doc, axis, anchor, self.align_reference.get() == "Printable area")
+            self.placement_changed()
+
+    def distribute_selection(self, axis):
+        try:
+            placement.distribute(self.items(), axis)
+        except ValueError as exc:
+            self.footer.set(str(exc))
+            return
+        self.placement_changed()
+
+    def placement_settings(self):
+        self.settings.update(grid=self.grid_visible.get(), snap=self.snap_grid.get())
+        self.persist_settings()
         self.draw_stage()
 
     def content_controls(self, parent, item):
         ttk.Label(parent, text="Label text" if item["kind"] == "text" else "Barcode value",
                   style="Muted.TLabel").pack(anchor="w", pady=(0, 3))
-        text = tk.Text(parent, height=3 if item["kind"] == "text" else 2, width=24,
-                       wrap="word", background="#f8f9fd", foreground=INK, insertbackground=INK,
-                       relief="solid", borderwidth=1, padx=5, pady=4, undo=True)
+        text = self.editor_text = tk.Text(parent, height=5 if item["kind"] == "text" else 2, width=24,
+                                          wrap="word", relief="flat", borderwidth=0, highlightthickness=1,
+                                          padx=6, pady=5, undo=True)
+        self.style_text(text)
         text.pack(fill="x", pady=(0, 7))
         text.insert("1.0", item["value"])
         text.edit_modified(False)
@@ -626,6 +868,7 @@ class App:
             if text.edit_modified():
                 text.edit_modified(False)
                 item["value"] = text.get("1.0", "end-1c")
+                self.layer_tree.set(item["id"], "layer", self.layer_title(item))
                 self.changed()
 
         text.bind("<<Modified>>", update)
@@ -684,7 +927,7 @@ class App:
         ttk.Checkbutton(parent, text=label, variable=variable, command=change).pack(side=side, anchor="w", pady=3)
 
     def rebuild_page(self):
-        parent = self.page_panel.content
+        parent = self.page_panel
         for child in parent.winfo_children():
             child.destroy()
         title = tk.StringVar(value=self.doc["title"])
@@ -702,8 +945,13 @@ class App:
                                         if pair == (width, height)), "Custom"))
         w_value, h_value = tk.StringVar(value=f"{width:g}"), tk.StringVar(value=f"{height:g}")
         control = field(parent, "Roll preset", preset, ("Custom", *PRESETS))
-        width_control = field(parent, "Label length (mm)", w_value)
-        height_control = field(parent, "Label width (mm)", h_value)
+        size_row = ttk.Frame(parent)
+        size_row.pack(fill="x")
+        length_column, width_column = ttk.Frame(size_row), ttk.Frame(size_row)
+        for column in (length_column, width_column):
+            column.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        width_control = field(length_column, "Length · mm", w_value, width=7)
+        height_control = field(width_column, "Width · mm", h_value, width=7)
 
         def resize(*_):
             try:
@@ -714,10 +962,7 @@ class App:
                 return
             self.doc.update(width=next_width, height=next_height)
             for item in self.doc["elements"]:
-                item["w"] = min(item["w"], next_width)
-                item["h"] = min(item["h"], next_height)
-                item["x"] = max(0, min(item["x"], next_width - item["w"]))
-                item["y"] = max(0, min(item["y"], next_height - item["h"]))
+                placement.fit_box(item, (next_width, next_height))
             preset.set(next((name for name, pair in PRESETS.items()
                              if pair == (next_width, next_height)), "Custom"))
             self.rebuild_elements()
