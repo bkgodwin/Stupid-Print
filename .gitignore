@@ -1,0 +1,5 @@
+.venv/
+.qa/
+__pycache__/
+*.py[cod]
+*.stupidprint
