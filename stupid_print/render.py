@@ -165,7 +165,7 @@ def _lines(text, font, size, stroke, limit):
         yield line
 
 
-def _text_image(item, value, size):
+def _text_image(item, value, size, smooth=False):
     width, height = (side * TEXT_SCALE for side in size)
     points = float(item["size"])
     if not 3 <= points <= 96:
@@ -214,6 +214,8 @@ def _text_image(item, value, size):
                 "Right": width - line_width - shear}[item["align"]]
         result.paste(line_image, (left, top))
         top += leading
+    if smooth:
+        return result
     # Convert high-resolution coverage to native dots without the old dark cutoff
     # thickening every partially covered edge. Preserve light strokes in tiny type.
     threshold = 165 if pixels <= 16 * TEXT_SCALE else 145
@@ -275,7 +277,7 @@ def _read_image(encoded):
         return source.convert("RGBA")
 
 
-def _picture(item, size):
+def _picture(item, size, smooth=False):
     source = ImageOps.contain(_read_image(item["image"]), size, Image.Resampling.LANCZOS)
     # Work on the artwork before adding the empty margins of the image box.
     gray = Image.new("L", source.size, 255)
@@ -283,68 +285,79 @@ def _picture(item, size):
     gray = ImageOps.autocontrast(gray, cutoff=1, preserve_tone=True)
     gray = gray.filter(ImageFilter.UnsharpMask(radius=0.8, percent=85, threshold=3))
     gray = gray.point(lambda pixel: 255 if pixel >= 245 else (0 if pixel <= 12 else pixel))
-    if item["dither"]:
+    if not smooth and item["dither"]:
         gray = gray.convert("1", dither=Image.Dither.FLOYDSTEINBERG).convert("L")
-    else:
+    elif not smooth:
         gray = gray.point(lambda pixel: 0 if pixel < 155 else 255)
     layer = Image.new("L", size, 255)
     layer.paste(gray, ((size[0] - gray.width) // 2, (size[1] - gray.height) // 2))
     return layer
 
 
-def render_label(doc, batch, index):
-    width, height = map(dots, dimensions(doc))
+def render_label(doc, batch, index, *, smooth=False):
+    """Compose the same design as native dots or high-resolution editor artwork."""
+    scale = TEXT_SCALE if smooth else 1
+    width, height = (dots(side) * scale for side in dimensions(doc))
+    head = HEAD_DOTS * scale
     result = Image.new("L", (width, height), 255)
     draw = ImageDraw.Draw(result)
     border = doc["border"]
     if border != "None":
-        inset = dots(0.6)
-        top = max(inset, (height - HEAD_DOTS) // 2 + inset)
+        inset = dots(0.6) * scale
+        top = max(inset, (height - head) // 2 + inset)
         box = (inset, top, width - inset - 1, height - top - 1)
-        thickness = max(1, min(8, int(doc["border_width"])))
+        thickness = max(1, min(8, int(doc["border_width"]))) * scale
         if border == "Rounded":
-            draw.rounded_rectangle(box, radius=dots(1.6), outline=0, width=thickness)
+            draw.rounded_rectangle(box, radius=dots(1.6) * scale, outline=0, width=thickness)
         else:
             draw.rectangle(box, outline=0, width=thickness)
             if border == "Double":
-                gap = thickness + 3
+                gap = thickness + 3 * scale
                 draw.rectangle((box[0] + gap, box[1] + gap, box[2] - gap, box[3] - gap),
                                outline=0, width=thickness)
     context = batch.context(index)
     for item in doc["elements"]:
-        x, y = dots(item["x"]), dots(item["y"])
+        x, y = dots(item["x"]) * scale, dots(item["y"]) * scale
         size = (dots(item["w"]), dots(item["h"]))
         if min(size) <= 0 or size[0] > 1600 or size[1] > 120:
             raise ValueError("An element has an invalid size.")
         kind = item["kind"]
+        display_size = (size[0] * scale, size[1] * scale)
         if kind == "text":
             value = batch.expand(item["value"], context)
-            layer = _text_image(item, value, size)
+            layer = _text_image(item, value, size, smooth=smooth)
         elif kind == "barcode":
             layer = _barcode_image(item, batch.expand(item["value"], context), size)
+            if smooth:
+                layer = layer.resize(display_size, Image.Resampling.NEAREST)
             # White spaces and quiet zones are part of a scannable symbol.
             result.paste(layer, (x, y))
             continue
         elif kind == "line":
-            layer = Image.new("L", size, 0)
+            layer = Image.new("L", display_size, 0)
         elif item["image"]:
-            layer = _picture(item, size)
+            layer = _picture(item, display_size, smooth=smooth)
         else:
             continue
         # Composite black ink only. An element's white background leaves the design below visible.
-        result.paste(0, (x, y, x + size[0], y + size[1]), ImageOps.invert(layer))
-    if height > HEAD_DOTS:
-        margin = (height - HEAD_DOTS) // 2
+        result.paste(0, (x, y, x + display_size[0], y + display_size[1]), ImageOps.invert(layer))
+    if height > head:
+        margin = ((height // scale - HEAD_DOTS) // 2) * scale
         result.paste(255, (0, 0, width, margin))
-        result.paste(255, (0, margin + HEAD_DOTS, width, height))
-    return result.convert("1", dither=Image.Dither.NONE)
+        result.paste(255, (0, margin + head, width, height))
+    return result if smooth else result.convert("1", dither=Image.Dither.NONE)
 
 
-def raster_packet(image, continuous=False):
-    rotated = image.convert("L").transpose(Image.Transpose.ROTATE_270)
-    raster_height = rotated.height + (56 if continuous else 0)
+def head_raster(image, rotation, extra_rows=0):
+    rotated = image.convert("L").transpose(rotation)
+    raster_height = rotated.height + extra_rows
     raster = Image.new("L", (HEAD_DOTS, raster_height), 255)
     # Center both padding and the crop so all media share the same centerline.
     raster.paste(rotated, ((HEAD_DOTS - rotated.width) // 2, 0))
+    return raster
+
+
+def raster_packet(image, continuous=False):
+    raster = head_raster(image, Image.Transpose.ROTATE_270, 56 if continuous else 0)
     ink = ImageOps.invert(raster).convert("1", dither=Image.Dither.NONE).tobytes()
-    return bytes.fromhex("1f1124001b401d763000") + struct.pack("<HH", HEAD_DOTS // 8, raster_height) + ink
+    return bytes.fromhex("1f1124001b401d763000") + struct.pack("<HH", HEAD_DOTS // 8, raster.height) + ink
