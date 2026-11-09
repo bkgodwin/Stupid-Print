@@ -10,12 +10,13 @@ from uuid import uuid4
 
 from PIL import Image, ImageTk
 
-from .dialogs import BatchSetup, ChoiceDialog, PrintDialog
+from .artwork import EMOJI_GRAPHICS, GRAPHICS
+from .dialogs import BatchSetup, ChoiceDialog, FontPicker, GraphicPicker, PrintDialog
 from .model import (EXTENSION, PRESETS, Batch, Library, dimensions, element, excel_sheets,
                     import_data, new_document, read_document, write_json)
 from . import placement
-from .printer import D30, available_ports, suggested_port
-from .render import BARCODES, DPI, EMOJIS, embed_image, font_catalog, render_label
+from .printer import PrinterPort, available_ports, connect_printer, suggested_port
+from .render import BARCODES, DPI, embed_image, render_label
 from .widgets import BatchList, button, configure_style, field, tree_with_scroll
 
 
@@ -37,6 +38,10 @@ class App:
         self.editor_text = None
         self.printer_busy = False
         self.printer_tone = "muted"
+        self.ports = {}
+        self.checked_device = ""
+        self.printer_model = ""
+        self.loaded_roll = None
         self.status_events = queue.SimpleQueue()
         self.port = tk.StringVar(value=self.settings.get("port", ""))
         self.printer_title = tk.StringVar(value="Printer status")
@@ -50,6 +55,7 @@ class App:
         self.batch_visible = tk.BooleanVar(value=True)
         self.grid_visible = tk.BooleanVar(value=bool(self.settings.get("grid", False)))
         self.snap_grid = tk.BooleanVar(value=bool(self.settings.get("snap", False)))
+        self.print_dots = tk.BooleanVar(value=bool(self.settings.get("print_dots", False)))
         self.align_reference = tk.StringVar(value="Selection")
         self.library_paths = {}
         self.library_names = {}
@@ -61,6 +67,7 @@ class App:
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.bind("<Control-s>", lambda _: self.save())
         root.bind("<Control-n>", lambda _: self.new_project())
+        root.bind("<Control-o>", lambda _: self.open_file())
         root.bind("<Control-p>", lambda _: self.open_print())
         self.build()
         self.apply_theme()
@@ -126,8 +133,9 @@ class App:
         button(actions, "Use as copy", lambda: self.open_saved(True)).pack(side="left", padx=5)
         project = ttk.Menubutton(parent, text="Project files")
         self.project_menu = tk.Menu(project, tearoff=False)
-        for label, command in (("Open .stupidprint file…", self.open_file),
-                               ("Save as template…", self.save_template),
+        self.project_menu.add_command(label="Open .stupidprint file…", command=self.open_file,
+                                      accelerator="Ctrl+O")
+        for label, command in (("Save as template…", self.save_template),
                                ("Export project file…", self.export_project),
                                ("Export current label PNG…", self.export_image)):
             self.project_menu.add_command(label=label, command=command)
@@ -139,13 +147,16 @@ class App:
         self.printer_badge.pack(anchor="w")
         ttk.Label(parent, textvariable=self.printer_detail, wraplength=210,
                   style="Muted.TLabel").pack(fill="x", pady=(3, 8))
-        self.port_field = field(parent, "Bluetooth serial port", self.port, (), editable=True)
+        self.port_field = field(parent, "Bluetooth printer / serial port", self.port, (), editable=True)
         self.port_field.bind("<<ComboboxSelected>>", lambda _: self.check_printer())
         self.port_field.bind("<Return>", lambda _: self.check_printer())
         actions = ttk.Frame(parent)
         actions.pack(fill="x")
         button(actions, "Check status", self.check_printer).pack(side="left")
-        button(actions, "Find ports", self.find_ports).pack(side="left", padx=5)
+        button(actions, "Find printers", self.refresh_printers).pack(side="left", padx=5)
+        self.use_roll_button = button(parent, "Use loaded roll", self.use_loaded_roll)
+        self.use_roll_button.state(["disabled"])
+        self.use_roll_button.pack(fill="x", pady=(5, 0))
 
     def build_stage(self, parent):
         ttk.Label(parent, textvariable=self.heading, style="Title.TLabel").pack(anchor="w")
@@ -154,14 +165,17 @@ class App:
         toolbar.pack(fill="x", pady=(0, 8))
         for name, action in (("+ Text", lambda: self.add_item("text")),
                              ("+ Barcode", lambda: self.add_item("barcode")),
-                             ("+ Image", self.add_image), ("+ Rule", lambda: self.add_item("line"))):
+                             ("+ Image", self.add_image), ("+ Graphic", self.add_graphic)):
             button(toolbar, name, action).pack(side="left", padx=(0, 4))
+        ttk.Checkbutton(toolbar, text="Print dots", variable=self.print_dots,
+                        command=self.preview_mode_changed).pack(side="right")
         self.canvas = tk.Canvas(parent, highlightthickness=0, height=188, takefocus=True)
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", lambda _: self.draw_stage())
         self.canvas.bind("<ButtonPress-1>", self.canvas_press)
         self.canvas.bind("<B1-Motion>", self.canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self.canvas_release)
+        self.canvas.bind("<Double-Button-1>", self.edit_on_canvas)
         self.canvas.bind("<KeyPress>", self.canvas_key)
         self.canvas.bind("<Control-a>", lambda _: self.select_all())
         self.canvas.bind("<Control-d>", lambda _: self.duplicate_item() or "break")
@@ -266,56 +280,103 @@ class App:
 
     def find_ports(self):
         try:
-            ports = available_ports()
+            port = self.selected_port()
+            self.ports = available_ports()
         except OSError as exc:
             self.printer_detail.set(str(exc))
             return
-        self.port_field.configure(values=tuple(ports))
-        if not self.port.get():
-            self.port.set(suggested_port(ports))
-        if not self.port.get():
+        self.port_field.configure(values=tuple(candidate.display for candidate in self.ports.values()))
+        port = self.ports.get(port.device, port) if port else suggested_port(self.ports)
+        if port:
+            self.port.set(port.display)
+        else:
             self.printer_title.set("Printer offline")
-            self.printer_detail.set("Pair the D30 and select its outgoing Bluetooth serial port.")
+            self.printer_detail.set("Pair a D30 or P21 and select its outgoing Bluetooth serial port.")
+
+    def refresh_printers(self):
+        if not self.printer_busy:
+            self.find_ports()
+            if self.selected_port():
+                self.check_printer()
+
+    def selected_port(self):
+        choice = self.port.get().strip()
+        if not choice:
+            return None
+        return next((port for port in self.ports.values() if choice in (port.display, port.device)),
+                    PrinterPort(choice))
 
     def check_printer(self):
         if self.printer_busy:
             return
-        port = self.port.get().strip()
-        if not port:
+        port = self.selected_port()
+        if port is None:
+            self.loaded_roll = None
+            self.use_roll_button.state(["disabled"])
             self.printer_title.set("Printer offline")
             self.printer_detail.set("Choose or enter a Bluetooth serial port.")
             return
         self.printer_busy = True
+        self.port_field.state(["disabled"])
+        self.use_roll_button.state(["disabled"])
         self.printer_tone = "muted"
         self.printer_badge.configure(foreground=self.colors[self.printer_tone])
         self.printer_title.set("Checking printer…")
-        self.printer_detail.set(port)
-        self.settings["port"] = port
+        self.printer_detail.set(port.display)
+        self.settings["port"] = port.device
         self.persist_settings()
 
         def check():
             try:
-                with D30(port) as printer:
-                    status = printer.status()
-                self.status_events.put((not status.issue, status.description))
+                with connect_printer(port) as (printer, status):
+                    self.status_events.put((printer.model, status, ""))
             except (OSError, ValueError):
-                self.status_events.put((False, f"Could not reach {port}. Check printer power, "
-                                               "Bluetooth pairing, and serial-port access."))
+                self.status_events.put(("", None, f"Could not detect a printer on {port.device}. "
+                                                 "Check power, pairing, and the outgoing port."))
 
         threading.Thread(target=check, daemon=True).start()
         self.root.after(100, self.poll_status)
 
     def poll_status(self):
         try:
-            ready, details = self.status_events.get_nowait()
+            model, status, error = self.status_events.get_nowait()
         except queue.Empty:
             self.root.after(100, self.poll_status)
             return
         self.printer_busy = False
-        self.printer_title.set("Printer ready" if ready else "Printer attention")
+        self.port_field.state(["!disabled"])
+        self.checked_device = self.settings["port"]
+        self.printer_model = model
+        self.loaded_roll = status.roll if status else None
+        ready = status is not None and not status.issue
+        self.printer_title.set(model or "Printer offline")
         self.printer_tone = "good" if ready else "error"
         self.printer_badge.configure(foreground=self.colors[self.printer_tone])
-        self.printer_detail.set(details)
+        if status:
+            self.printer_detail.set(f"{status.issue or 'Ready'} · {status.description}"
+                                    if status.issue != status.description else status.description)
+        else:
+            self.printer_detail.set(error)
+        if self.loaded_roll and self.loaded_roll.media in ("Gap labels", "Continuous tape"):
+            self.use_roll_button.state(["!disabled"])
+
+    def use_loaded_roll(self):
+        port = self.selected_port()
+        roll = self.loaded_roll
+        if not port or port.device != self.checked_device or not roll:
+            self.check_printer()
+            return
+        self.set_label_size(roll.length, roll.width, keep_center=True)
+        self.doc["media"] = roll.media
+        self.rebuild_page()
+        self.tabs.select(self.page_panel)
+        self.changed()
+        self.footer.set(f"Set design to {roll.description}")
+
+    def preview_mode_changed(self):
+        self.settings["print_dots"] = self.print_dots.get()
+        self.persist_settings()
+        self.draw_stage()
 
     def persist_settings(self):
         try:
@@ -517,11 +578,13 @@ class App:
         canvas.create_rectangle(x, y, x + w, y + h, fill="white", outline="")
         try:
             batch = self.batch or Batch(self.doc)
-            image = render_label(self.doc, batch, self.preview_number - 1)
-            self.photo = ImageTk.PhotoImage(image.resize((w, h), Image.Resampling.NEAREST), master=self.root)
+            smooth = not self.print_dots.get()
+            image = render_label(self.doc, batch, self.preview_number - 1, smooth=smooth)
+            filter_mode = Image.Resampling.LANCZOS if smooth else Image.Resampling.NEAREST
+            self.photo = ImageTk.PhotoImage(image.resize((w, h), filter_mode), master=self.root)
             canvas.create_image(x, y, image=self.photo, anchor="nw")
-            self.preview_note.set(f"Label {self.preview_number:,} of {batch.count:,}  ·  {DPI} dpi  ·  "
-                                  "Shift-click to select more")
+            view = "Smooth design preview" if smooth else f"Print dots · {DPI} DPI"
+            self.preview_note.set(f"Label {self.preview_number:,} of {batch.count:,}  ·  {view}")
         except (OSError, ValueError, TypeError, KeyError, IndexError) as exc:
             self.preview_note.set(str(exc))
         if self.grid_visible.get():
@@ -602,6 +665,13 @@ class App:
             if any(item[first] != a or item[second] != b for item, first, a, second, b in originals):
                 self.placement_changed()
 
+    def edit_on_canvas(self, _):
+        if self.editor_text is not None:
+            self.drag = None
+            self.tabs.select(self.item_panel)
+            self.editor_text.focus_set()
+        return "break"
+
     def canvas_key(self, event):
         directions = {"Left": (-1, 0), "Right": (1, 0), "Up": (0, -1), "Down": (0, 1)}
         if event.keysym == "Delete":
@@ -639,8 +709,10 @@ class App:
     def add_item(self, kind, **values):
         w, _ = dimensions(self.doc)
         _, top, _, bottom = placement.printable_area(self.doc)
-        height = min(bottom - top - 1, {"text": 4, "line": .25}.get(kind, 8))
-        width = min(w - 2, 10) if kind == "image" else w - 2
+        height = min(bottom - top - 1, {"text": 4, "line": .25, "graphic": 7}.get(kind, 8))
+        width = min(w - 2, 10) if kind in ("graphic", "image") else w - 2
+        if kind == "graphic" and values.get("asset") == "rule":
+            width, height = w - 2, .75
         previous = self.item()
         below = previous["y"] + previous["h"] + .5 if previous else top + 1
         y = below if below + height <= bottom else top + .5
@@ -666,6 +738,18 @@ class App:
                 self.add_item("image", **values)
         except (OSError, ValueError, Image.DecompressionBombError) as exc:
             messagebox.showerror("Import image", str(exc), parent=self.root)
+
+    def add_graphic(self, replace=False):
+        item = self.item() if replace else None
+        key = GraphicPicker(self.root, item["asset"] if item else None).result
+        if key is None:
+            return
+        if item:
+            item["asset"] = key
+            self.rebuild_elements()
+            self.changed()
+        else:
+            self.add_item("graphic", asset=key)
 
     def duplicate_item(self):
         copies = [{**source, "id": uuid4().hex} for source in self.items()]
@@ -700,6 +784,8 @@ class App:
 
     @staticmethod
     def layer_title(item):
+        if item["kind"] == "graphic":
+            return f"Graphic   {GRAPHICS[item['asset']].name}"
         name = item.get("value") or item.get("filename") or ""
         summary = " ".join(name.split())
         if len(summary) > 30:
@@ -732,13 +818,15 @@ class App:
         elif item["kind"] == "image":
             ttk.Label(parent, text=item["filename"], wraplength=235).pack(anchor="w")
             button(parent, "Replace image…", lambda: self.add_image(True)).pack(anchor="w", pady=6)
+        elif item["kind"] == "graphic":
+            ttk.Label(parent, text=GRAPHICS[item["asset"]].name, style="Section.TLabel").pack(anchor="w")
+            button(parent, "Replace graphic…", lambda: self.add_graphic(True)).pack(anchor="w", pady=6)
         else:
             ttk.Label(parent, text="Use Place to position and size this rule.",
                       wraplength=245, style="Muted.TLabel").pack(anchor="w")
         parent = self.style_panel
         if item["kind"] == "text":
-            families = ("Default", *sorted(font_catalog(), key=str.casefold))
-            self.item_field(parent, item, "font", "Font family", families)
+            self.font_control(parent, item)
             self.item_field(parent, item, "size", "Text size (pt)", numeric=(3, 96))
             row = ttk.Frame(parent)
             row.pack(fill="x")
@@ -756,6 +844,23 @@ class App:
             self.check_item(parent, item, "dither", "Dither image")
             ttk.Label(parent, text="Dither photos for tonal detail. Turn it off for solid logos.",
                       wraplength=235, style="Muted.TLabel").pack(anchor="w", pady=5)
+        elif item["kind"] == "graphic":
+            self.check_item(parent, item, "dither", "Dither shading")
+            ttk.Label(parent, text="Turn off shading for a high-contrast graphic.",
+                      wraplength=235, style="Muted.TLabel").pack(anchor="w", pady=5)
+
+    def font_control(self, parent, item):
+        ttk.Label(parent, text="Font family", style="Muted.TLabel").pack(anchor="w", pady=(0, 2))
+        current = tk.StringVar(value=item["font"] + "…")
+
+        def choose():
+            chosen = FontPicker(self.root, item["font"]).result
+            if chosen is not None and chosen != item["font"]:
+                item["font"] = chosen
+                current.set(chosen + "…")
+                self.changed()
+
+        ttk.Button(parent, textvariable=current, command=choose).pack(fill="x", pady=(0, 5))
 
     def rebuild_placement(self):
         parent = self.place_panel
@@ -885,12 +990,16 @@ class App:
 
         choices.bind("<<ComboboxSelected>>", insert_token)
         if item["kind"] == "text":
+            entries = {}
+            for character, key in EMOJI_GRAPHICS.items():
+                entries.setdefault(GRAPHICS[key].name, character)
             emoji = tk.StringVar(value="Insert an emoji…")
-            picker = ttk.Combobox(parent, textvariable=emoji, state="readonly", values=EMOJIS, width=16)
+            picker = ttk.Combobox(parent, textvariable=emoji, state="readonly",
+                                  values=tuple(sorted(entries)), width=16)
             picker.pack(fill="x", pady=(0, 6))
 
             def insert_emoji(_):
-                text.insert("insert", emoji.get())
+                text.insert("insert", entries[emoji.get()])
                 emoji.set("Insert an emoji…")
                 text.focus_set()
 
@@ -958,15 +1067,10 @@ class App:
                 next_width, next_height = dimensions({"width": w_value.get(), "height": h_value.get()})
             except ValueError:
                 return
-            if (next_width, next_height) == dimensions(self.doc):
+            if not self.set_label_size(next_width, next_height):
                 return
-            self.doc.update(width=next_width, height=next_height)
-            for item in self.doc["elements"]:
-                placement.fit_box(item, (next_width, next_height))
             preset.set(next((name for name, pair in PRESETS.items()
                              if pair == (next_width, next_height)), "Custom"))
-            self.rebuild_elements()
-            self.changed()
 
         def select_preset(_):
             chosen = PRESETS.get(preset.get())
@@ -982,14 +1086,28 @@ class App:
         self.item_field(parent, self.doc, "media", "Media type", ("Gap labels", "Continuous tape"))
         self.item_field(parent, self.doc, "border", "Border style", ("None", "Rectangle", "Rounded", "Double"))
         self.item_field(parent, self.doc, "border_width", "Border weight (dots)", numeric=(1, 8))
-        ttk.Label(parent, text="The D30 prints across the center 12 mm. On wider stock, "
+        ttk.Label(parent, text="Both printers use a 12 mm print head. On wider stock, "
                   "dashed guides show the printable strip.", wraplength=236,
                   style="Muted.TLabel").pack(anchor="w", pady=5)
         if self.doc["data"]["rows"]:
             button(parent, "Clear imported data", self.clear_source).pack(anchor="w", pady=7)
 
+    def set_label_size(self, length, width, keep_center=False):
+        previous = dimensions(self.doc)
+        if (length, width) == previous:
+            return False
+        self.doc.update(width=length, height=width)
+        for item in self.doc["elements"]:
+            if keep_center:
+                item["y"] = max(0, round(item["y"] + (width - previous[1]) / 2, 3))
+            placement.fit_box(item, (length, width))
+        self.rebuild_elements()
+        self.changed()
+        return True
+
     def open_print(self):
-        if not self.port.get().strip():
+        port = self.selected_port()
+        if not port:
             messagebox.showinfo("Print labels", "Select the printer’s Bluetooth serial port first.", parent=self.root)
             return
         try:
@@ -999,9 +1117,9 @@ class App:
             return
         if self.dirty and not self.save():
             return
-        self.settings["port"] = self.port.get().strip()
+        self.settings["port"] = port.device
         self.persist_settings()
-        PrintDialog(self, batch, min(self.preview_number, batch.count))
+        PrintDialog(self, batch, min(self.preview_number, batch.count), port)
 
     def close(self):
         if self.printer_busy and any(isinstance(window, PrintDialog) for window in self.root.winfo_children()):

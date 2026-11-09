@@ -1,6 +1,6 @@
 # Stupid Print
 
-Stupid Print is a Python desktop label studio for the Phomemo D30 family. It designs and previews monochrome thermal labels and prints directly over Bluetooth Classic serial.
+Stupid Print is a Python desktop label studio for the Phomemo D30 and Nelko P21. It designs and previews monochrome thermal labels and prints directly over Bluetooth Classic serial.
 
 ## Start the app
 
@@ -16,21 +16,26 @@ Both launchers look for Python 3.10 or later with working Tcl/Tk, create a local
 
 ### Connect the printer
 
-1. Power on the D30 and pair it with your computer. Close any phone app currently using the printer.
+1. Power on the printer and pair it with your computer. Close any phone app currently using the printer.
 2. On Windows, select its **outgoing** Bluetooth serial port. Windows lists it under Bluetooth settings → More Bluetooth settings → COM Ports. On the tested D30N, it was `COM3`.
 3. On Linux, pair with BlueZ and expose the printer’s Serial Port Profile using RFCOMM. For example, with the printer’s Bluetooth address and SPP channel, run `sudo rfcomm bind 0 AA:BB:CC:DD:EE:FF 1` and select `/dev/rfcomm0`. Use your actual SPP channel if it differs. Your account needs permission to open that device, commonly through the distribution’s serial-device group. Keep the application running as your regular user.
-4. Click **Check status**. The library and last printer port reopen at startup.
+4. Click **Find printers** to refresh the list, then select the printer or enter its outgoing serial port. Stupid Print identifies the selected protocol by querying the printer. The library and last port reopen at startup.
+5. With a P21 and a readable roll tag, use **Use loaded roll** to apply the printer’s reported label size. The **40 × 14 mm** preset matches Nelko’s included 14 × 40 mm gap labels. If the tag is unreadable, select the size manually. The app checks readable stock again before printing. [Nelko P21 specifications](https://nelko.com/products/nelko-p21-portable-bluetooth-label-printer)
 
-The D30N protocol has been tested on Windows. Linux Bluetooth hardware still needs an end-to-end test. This app uses RFCOMM serial for D30-family units with an SPP service.
+The D30N protocol has been tested on Windows. The P21 implementation is based on captured serial traffic and still needs a physical test. Linux Bluetooth hardware also needs an end-to-end test. Both drivers use RFCOMM serial.
 
 ## Design and save labels
 
 - Stupid Print starts in dark mode. Use **Light mode** in the header to switch. The app remembers your choice.
-- Use **Label** for paper size, media type and border. Dimensions are length × width. The D30 prints at 203 DPI across the center 12 mm on wider stock. [Phomemo D30 specifications](https://phomemo.com/pages/download-center-d30)
-- Add text, barcodes, images or rules. **Content** edits values, **Style** controls appearance, and **Place** handles geometry. Use **Hide** beside **Batch preview** when you want more room for the canvas.
+- Use **Label** for paper size, media type and border. Dimensions are length × width. Both printers use a 96-dot head at nominal 203 DPI. On wider stock, the editor guides show the centered 12 mm printable strip. [Phomemo D30 specifications](https://phomemo.com/pages/download-center-d30) · [Nelko P21 protocol capture](https://github.com/merlinschumacher/nelko-p21-print)
+- Add text, barcodes, images or built-in graphics. **Content** edits values, **Style** controls appearance, and **Place** handles geometry. Use **Hide** beside **Batch preview** when you want more room for the canvas.
 - Drag an element or its resize handle. Shift-click on the canvas or use the Layers list to select multiple elements. **Place** offers exact millimeter positions, a 1 mm grid and snap, edge and center alignment, and even spacing for three or more elements. Choose **Printable area** to move the selection as a block or **Selection** to align its members. With the canvas focused, arrow keys nudge by one printer dot and Shift + arrow nudges by 1 mm.
-- Text supports system fonts, size, bold, italic, underline, horizontal and vertical alignment, wrapping, shrink-to-fit and emoji. Text is rendered at higher resolution and reduced to the printer's dots. Images use contrast adjustment and sharpening before conversion to monochrome. Use **Dither image** for photos or turn it off for solid logos.
-- Linear barcode choices are Code 128, Code 39, EAN-13 and UPC-A. The app preserves white gaps and quiet zones over lower layers and defaults to at least two printer dots per module. Use a wider box, shorten the value, or enable **Allow compact bars** on small labels and scan a sample. EAN-13 and UPC-A validate a supplied check digit or calculate it when omitted.
+- Double-click text or a barcode on the canvas to edit its value. The editor shows smooth text by default. Turn on **Print dots** to see the exact monochrome raster used by print preview and PNG export.
+- Text supports size, bold, italic, underline, alignment, wrapping, shrink-to-fit and emoji. The searchable font picker puts recommended English fonts above a divider, with other usable system fonts below. Common emoji use built-in monochrome artwork. Other emoji use available system fonts, with a visible placeholder when no glyph is available.
+- **+ Graphic** adds inventory and IT symbols, common shapes and rules. **Dither shading** in Style adds tonal detail at print resolution. The catalog is stored as vector commands in `stupid_print/artwork.py`. Projects save a graphic key and its style, so each copy adds only a few fields.
+- Images use contrast adjustment and sharpening before conversion to monochrome. Use **Dither image** for photos or turn it off for solid logos.
+- Linear barcode choices are Code 128, Code 39, EAN-13 and UPC-A. UPC-A accepts 11 base digits, a complete 12-digit code, or the same code with the leading zero that some scanners add. Spaces and hyphens in UPC-A and EAN-13 are allowed. A supplied check digit is verified. Keep leading zeroes as text in imported spreadsheets.
+- Barcode boxes reserve white space around the bars. The app catches clipped boxes and artwork that covers the scan area before printing. UPC-A and EAN-13 place their digits and extend the guard bars when there is room for a caption. The app defaults to at least two printer dots per module. Give the code enough height and width, then scan a sample on your stock. [GS1 UPC-A specifications](https://ref.gs1.org/standards/genspecs/)
 - Edits autosave to the local library. **Save as template** keeps a reusable copy. Open any saved item to edit it, or choose **Use as copy** to start a new project from it.
 - The **Project files** menu contains template saving and export. Exporting a project creates a portable `.stupidprint` JSON document with embedded images and imported data. PNG export saves the current label at printer resolution.
 
@@ -52,10 +57,10 @@ Insert fields into a text or barcode element with the inspector or type them dir
 2. For a data merge, choose **Import CSV / Excel**. The first populated row supplies column headers. CSV, TSV, XLSX and XLSM are supported, including worksheet choice. Excel formulas use their saved cached values. A count of **0** uses every imported data row.
 3. Browse **Batch preview** to see every label. Use the arrows to change pages or enter a label number to jump to it.
 4. Open **Print batch**, then tick individual rows, choose **Select all**, or add ranges such as `1, 4-8, 12`. The dialog previews the focused label and shows the selected count. Set **Copies each** if needed.
-5. Click **Print selected**. The app validates the chosen labels before printing and waits for the printer to confirm each one. **Stop after current label** stops the remaining queue. If a job times out, check the physical output before sending it again.
+5. Click **Print selected**. The app validates the chosen labels before printing. The D30 confirms completed prints. The P21 uses a ready-status check between jobs and reports how many labels were sent. **Stop after current label** stops the remaining queue. If a job times out, check the physical output before sending it again.
 
 ## Development
 
 The GUI uses Tkinter. Pillow handles raster rendering, pySerial handles Bluetooth serial, openpyxl reads Excel files, and python-barcode encodes linear barcodes. Run the tests with `python -m unittest discover -s tests -v` in the project virtual environment.
 
-The D30 wire format is based on published protocol research in [polskafan/phomemo_d30](https://github.com/polskafan/phomemo_d30) and [Phomymo](https://github.com/transcriptionstream/phomymo).
+The D30 wire format is based on published protocol research in [polskafan/phomemo_d30](https://github.com/polskafan/phomemo_d30) and [Phomymo](https://github.com/transcriptionstream/phomymo). The P21 driver uses the protocol documented by [merlinschumacher/nelko-p21-print](https://github.com/merlinschumacher/nelko-p21-print).

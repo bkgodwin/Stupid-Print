@@ -6,12 +6,14 @@ import time
 import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
 
-from PIL import Image, ImageTk
+from PIL import Image, ImageDraw, ImageTk
 
-from .model import Batch, Selection
-from .printer import D30
-from .render import raster_packet, render_label
-from .widgets import BatchList, button, field
+from .artwork import GRAPHICS, graphic_layer
+from .fonts import font_picker_sections, select_font
+from .model import Batch, Selection, dimensions
+from .printer import connect_printer
+from .render import DPI, render_label
+from .widgets import BatchList, button, field, tree_with_scroll
 
 
 class SettingsDialog(simpledialog.Dialog):
@@ -41,6 +43,129 @@ class ChoiceDialog(SettingsDialog):
 
     def apply(self):
         self.result = self.variable.get()
+
+
+class GraphicPicker(SettingsDialog):
+    def __init__(self, parent, initial=None):
+        self.initial = initial
+        super().__init__(parent, "Built-in graphics")
+
+    def body(self, parent):
+        super().body(parent)
+        categories = tuple(dict.fromkeys(graphic.category for graphic in GRAPHICS.values()))
+        self.category = tk.StringVar(value=GRAPHICS[self.initial].category if self.initial else categories[0])
+        category = field(parent, "Category", self.category, categories)
+        category.bind("<<ComboboxSelected>>", lambda _: self.populate())
+        row = ttk.Frame(parent)
+        row.pack(fill="both", expand=True)
+        frame, self.tree = tree_with_scroll(row, ("name",), height=9, selectmode="browse")
+        self.tree.configure(show="")
+        self.tree.column("name", width=202)
+        frame.pack(side="left", fill="both", expand=True)
+        preview = ttk.Frame(row, padding=(12, 5))
+        preview.pack(side="left")
+        ttk.Label(preview, text="Print preview", style="Muted.TLabel").pack(pady=(0, 6))
+        self.sample = ttk.Label(preview)
+        self.sample.pack()
+        self.tree.bind("<<TreeviewSelect>>", lambda _: self.draw_sample())
+        self.tree.bind("<Double-Button-1>", self.ok)
+        self.populate(self.initial)
+        return self.tree
+
+    def populate(self, preferred=None):
+        self.tree.delete(*self.tree.get_children())
+        choices = [(key, value.name) for key, value in GRAPHICS.items() if value.category == self.category.get()]
+        for key, name in sorted(choices, key=lambda item: item[1].casefold()):
+            self.tree.insert("", "end", iid=key, values=(name,))
+        key = preferred if preferred and self.tree.exists(preferred) else self.tree.get_children()[0]
+        self.tree.selection_set(key)
+        self.tree.focus(key)
+        self.tree.see(key)
+        self.draw_sample()
+
+    def draw_sample(self):
+        selection = self.tree.selection()
+        if selection:
+            image = graphic_layer(selection[0], (64, 64)).resize((128, 128), Image.Resampling.NEAREST)
+            self.photo = ImageTk.PhotoImage(image, master=self)
+            self.sample.configure(image=self.photo)
+
+    def validate(self):
+        return bool(self.tree.selection())
+
+    def apply(self):
+        self.result = self.tree.selection()[0]
+
+
+class FontPicker(SettingsDialog):
+    def __init__(self, parent, initial):
+        self.chosen = initial
+        self.sections = font_picker_sections()
+        super().__init__(parent, "Choose a font")
+
+    def body(self, parent):
+        super().body(parent)
+        self.filter = tk.StringVar()
+        search = field(parent, "Search fonts", self.filter)
+        self.trees = []
+        for index, (title, height) in enumerate((("Recommended English fonts", 5), ("System fonts", 7))):
+            if index:
+                ttk.Separator(parent).pack(fill="x", pady=8)
+            ttk.Label(parent, text=title, style="Muted.TLabel").pack(anchor="w", pady=(0, 4))
+            frame, tree = tree_with_scroll(parent, ("font",), height=height, selectmode="browse")
+            tree.configure(show="")
+            tree.column("font", width=360)
+            frame.pack(fill="x")
+            tree.bind("<<TreeviewSelect>>", lambda _, widget=tree: self.select_font(widget))
+            tree.bind("<Double-Button-1>", self.ok)
+            self.trees.append(tree)
+        self.sample = ttk.Label(parent, padding=(0, 9, 0, 0))
+        self.sample.pack()
+        self.filter.trace_add("write", lambda *_: self.populate())
+        self.populate()
+        return search
+
+    def populate(self):
+        query = self.filter.get().strip().casefold()
+        match = None
+        first = None
+        for tree, section in zip(self.trees, self.sections):
+            tree.delete(*tree.get_children())
+            for name in section:
+                if query in name.casefold():
+                    row = tree.insert("", "end", values=(name,))
+                    if first is None:
+                        first = (tree, row)
+                    if name == self.chosen:
+                        match = (tree, row)
+        if match or first:
+            tree, row = match or first
+            tree.selection_set(row)
+            tree.focus(row)
+            tree.see(row)
+            self.select_font(tree)
+        else:
+            self.sample.configure(image="", text="No usable fonts match your search.")
+
+    def select_font(self, tree):
+        selection = tree.selection()
+        if not selection:
+            return
+        for other in self.trees:
+            if other is not tree:
+                other.selection_remove(other.selection())
+        self.chosen = tree.set(selection[0], "font")
+        font, _, _ = select_font(self.chosen, 24)
+        image = Image.new("L", (360, 47), 255)
+        ImageDraw.Draw(image).text((180, 23), "Asset ID 0123456789", font=font, fill=0, anchor="mm")
+        self.photo = ImageTk.PhotoImage(image, master=self)
+        self.sample.configure(image=self.photo, text="")
+
+    def validate(self):
+        return any(tree.selection() for tree in self.trees)
+
+    def apply(self):
+        self.result = self.chosen
 
 
 class BatchSetup(SettingsDialog):
@@ -83,12 +208,16 @@ class BatchSetup(SettingsDialog):
 
 
 class PrintDialog(tk.Toplevel):
-    def __init__(self, app, batch, current):
+    def __init__(self, app, batch, current, port):
         super().__init__(app.root)
         self.app = app
         self.batch = batch
+        self.port = port
         self.selection = Selection([(current, current)])
         self.status = tk.StringVar(value="Choose labels in the list, or add a range.")
+        roll = app.loaded_roll if app.checked_device == port.device else None
+        if roll and (dimensions(batch.doc) != (roll.length, roll.width) or batch.doc["media"] != roll.media):
+            self.status.set(f"Last detected roll is {roll.description}. Use loaded roll in the editor to match it.")
         self.total = tk.StringVar()
         self.copies = tk.StringVar(value="1")
         self.expression = tk.StringVar()
@@ -108,12 +237,15 @@ class PrintDialog(tk.Toplevel):
         body = ttk.Frame(self, padding=17)
         body.pack(fill="both", expand=True)
         ttk.Label(body, text="Print labels", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(body, text=f"{batch.doc['title']} · {app.port.get()}",
+        printer = app.printer_model if app.checked_device == port.device else ""
+        target = f"{printer} · {port.device}" if printer else port.display
+        ttk.Label(body, text=f"{batch.doc['title']} · {target} · Print dots at {DPI} DPI",
                   style="Muted.TLabel").pack(anchor="w", pady=(1, 11))
         self.preview = ttk.Label(body, anchor="center", padding=(7, 8))
         self.preview.pack(fill="x")
         self.list = BatchList(body, self.show_preview, self.selection)
         self.list.on_toggle = self.update_count
+        self.list.can_toggle = lambda: self.stop is None
         self.list.pack(fill="both", expand=True, pady=(4, 10))
         controls = ttk.Frame(body)
         controls.pack(fill="x")
@@ -163,7 +295,7 @@ class PrintDialog(tk.Toplevel):
         if self.stop is not None:
             return
         self.selection.ranges = [(1, self.batch.count)] if select else []
-        self.list.show()
+        self.refresh_selection()
         self.update_count()
 
     def add_range(self):
@@ -174,9 +306,13 @@ class PrintDialog(tk.Toplevel):
         except ValueError as exc:
             self.status.set(str(exc))
             return
-        self.list.show()
+        self.refresh_selection()
         self.update_count()
         self.status.set("Range added to the selection.")
+
+    def refresh_selection(self):
+        focused = self.list.tree.selection()
+        self.list.show(focus=int(focused[0]) if focused else None)
 
     def start(self):
         try:
@@ -196,7 +332,7 @@ class PrintDialog(tk.Toplevel):
         self.close_button.configure(text="Stop after current label")
         self.progress.configure(value=0)
         selection = Selection(self.selection.ranges.copy())
-        thread = threading.Thread(target=self._print, args=(self.app.port.get().strip(), selection, copies),
+        thread = threading.Thread(target=self._print, args=(self.port, selection, copies),
                                   daemon=True)
         thread.start()
         self.after(100, self._poll)
@@ -205,6 +341,7 @@ class PrintDialog(tk.Toplevel):
         done = 0
         total = selection.count * copies
         number = 0
+        confirms_print = True
         try:
             # Validate before the first physical write, including every variable barcode.
             latest = 0.0
@@ -219,29 +356,32 @@ class PrintDialog(tk.Toplevel):
             if self.stop.is_set():
                 self.events.put(("end", "Stopped before printing."))
                 return
-            continuous = self.batch.doc["media"] == "Continuous tape"
-            with D30(port) as printer:
-                status = printer.status()
+            number = 0
+            with connect_printer(port) as (printer, status):
                 if status.issue:
                     raise OSError(status.issue)
+                printer.validate_stock(self.batch.doc, status)
+                confirms_print = printer.confirms_print
                 for number in selection:
                     if self.stop.is_set():
                         break
-                    packet = raster_packet(render_label(self.batch.doc, self.batch, number - 1), continuous)
+                    image = render_label(self.batch.doc, self.batch, number - 1)
                     for _ in range(copies):
                         if self.stop.is_set():
                             break
                         self.events.put(("status", f"Printing label {number:,} · {done + 1:,}/{total:,}"))
-                        printer.print_label(packet, continuous)
+                        printer.print_image(image, self.batch.doc, status)
                         done += 1
                         self.events.put(("progress", done / total))
-            result = f"Printed {done:,} of {total:,} labels." if done == total else (
-                f"Stopped after {done:,} of {total:,} labels."
-            )
+            verb = "Printed" if confirms_print else "Sent"
+            result = f"{verb} {done:,} of {total:,} labels."
+            if done != total:
+                result = "Stopped. " + result
             self.events.put(("end", result))
         except (OSError, ValueError, TypeError, KeyError) as exc:
             label = f"Label {number:,}: " if number else ""
-            self.events.put(("end", f"{label}{exc} ({done:,} confirmed.)"))
+            completed = "confirmed" if confirms_print else "sent with printer ready"
+            self.events.put(("end", f"{label}{exc} ({done:,} {completed}.)"))
 
     def _poll(self):
         while True:

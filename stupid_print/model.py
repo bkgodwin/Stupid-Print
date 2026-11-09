@@ -11,10 +11,12 @@ from datetime import date
 from pathlib import Path
 from uuid import uuid4
 
+from .artwork import GRAPHICS
+
 
 EXTENSION = ".stupidprint"
 TOKEN = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
-PRESETS = {"40 × 12 mm": (40, 12), "30 × 12 mm": (30, 12), "22 × 12 mm": (22, 12),
+PRESETS = {"40 × 12 mm": (40, 12), "40 × 14 mm": (40, 14), "30 × 12 mm": (30, 12), "22 × 12 mm": (22, 12),
            "12 × 12 mm": (12, 12), "30 × 14 mm": (30, 14), "40 × 15 mm": (40, 15)}
 
 
@@ -27,6 +29,8 @@ def element(kind, **values):
         item.update(value="12345", symbology="Code 128", caption=True, compact=False)
     elif kind == "image":
         item.update(image="", filename="", dither=True)
+    elif kind == "graphic":
+        item.update(asset="package", dither=True)
     item.update(values)
     return item
 
@@ -134,6 +138,10 @@ def _validate_element(item, used):
     elif kind == "image":
         if not all(isinstance(item[key], str) for key in ("image", "filename")) or not isinstance(item["dither"], bool):
             raise ValueError("Invalid image format.")
+    elif kind == "graphic":
+        if (not isinstance(item["asset"], str) or item["asset"] not in GRAPHICS
+                or not isinstance(item["dither"], bool)):
+            raise ValueError("Invalid built-in graphic.")
     elif kind != "line":
         raise ValueError("Unknown label element type.")
 
