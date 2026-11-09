@@ -2,6 +2,7 @@ import struct
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from PIL import Image
@@ -10,7 +11,9 @@ from openpyxl import Workbook
 from stupid_print import placement
 from stupid_print.model import (Batch, Library, Selection, element, excel_sheets, import_data,
                                 new_document, read_document)
-from stupid_print.printer import D30, PRINT_COMPLETE, PrinterStatus
+from stupid_print.printer import (D30, P21, PRINT_COMPLETE, P21_ROLL, P21_STATUS, LabelRoll,
+                                  PrinterPort, PrinterStatus, _label_roll, _nelko_config,
+                                  available_ports, connect_printer, nelko_packet, suggested_port)
 from stupid_print.render import HEAD_DOTS, embed_image, raster_packet, render_label
 
 
@@ -88,6 +91,17 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(len(packet), 14 + 12 * 176)
         self.assertEqual(sum(packet[15:]), 0)
         self.assertEqual(struct.unpack("<HH", raster_packet(image, True)[10:14]), (12, 232))
+
+    def test_smooth_preview_preserves_gray_edges_and_native_output(self):
+        doc = new_document()
+        doc["elements"][0].update(value="Aa 203", italic=True, size=9)
+        batch = Batch(doc)
+        native = render_label(doc, batch, 0)
+        smooth = render_label(doc, batch, 0, smooth=True)
+        self.assertEqual(native.mode, "1")
+        self.assertEqual(smooth.size, (native.width * 3, native.height * 3))
+        self.assertGreater(sum(smooth.histogram()[1:255]), 0)
+        self.assertEqual(render_label(doc, batch, 0).tobytes(), native.tobytes())
 
     def test_text_image_barcode_and_border_render_in_same_design(self):
         doc = new_document()
@@ -196,6 +210,94 @@ class PrinterTests(unittest.TestCase):
             printer.print_label(packet)
         self.assertEqual(printer.serial.writes[0], bytes.fromhex("1f110a1f110202"))
         self.assertEqual(b"".join(printer.serial.writes[1:]), packet)
+
+    def test_windows_names_outgoing_bluetooth_ports(self):
+        def port(device, suffix):
+            return SimpleNamespace(device=device, description="Bluetooth serial", hwid="BTHENUM\\SPP&" + suffix)
+
+        comports = [port("COM3", "D2380A501A47_C00000000"), port("COM4", "000000000000_00000000")]
+        with (patch("stupid_print.printer.os.name", "nt"),
+              patch("stupid_print.printer.list_ports.comports", return_value=comports),
+              patch("stupid_print.printer._windows_bluetooth_name", return_value="D30N")):
+            detected = available_ports()
+        self.assertEqual(list(detected), ["COM3"])
+        self.assertEqual(suggested_port(detected).display, "D30N  ·  COM3")
+
+    def test_generic_port_detects_phomemo_from_binary_reply(self):
+        reply = bytes.fromhex("1a 3b 04 01 00 02 00 1a 06 89 1a 07 00 00 09")
+        with (patch("stupid_print.printer.serial.Serial") as serial,
+              patch("stupid_print.printer.time.sleep"),
+              patch.object(D30, "_read", return_value=reply)):
+            serial.return_value.write.side_effect = len
+            with connect_printer(PrinterPort("/dev/rfcomm0")) as (printer, status):
+                self.assertIsInstance(printer, D30)
+                self.assertTrue(status.recognized)
+
+
+class NelkoTests(unittest.TestCase):
+    tag = bytes.fromhex("000c011203000301121215280f0eed03")
+    config = b"CONFIG " + bytes.fromhex("00cb0000030402040201") + b"\r\n"
+
+    def test_capture_config_and_roll(self):
+        self.assertEqual(_nelko_config(self.config), (203, "4.2.4"))
+        self.assertEqual(_nelko_config(self.config[:-2] + b"\x00" * 10 + b"\r\n"), (203, "4.2.4"))
+        self.assertEqual(_label_roll(self.tag), LabelRoll(40, 14, "Gap labels", 5))
+        self.assertIsNone(_label_roll(self.tag[:-1] + b"\x00"))
+
+    def test_40_by_14_packet_uses_96_dot_head_and_black_zero(self):
+        doc = new_document()
+        doc["height"] = 14
+        image = Image.new("1", (320, 112), 1)
+        image.putpixel((319, 8), 0)  # printable corner after counterclockwise rotation
+        image.putpixel((0, 0), 0)  # outside the printable strip
+        packet = nelko_packet(image, doc, 5)
+        prefix, ink_and_print = packet.split(b"BITMAP 0,0,12,320,1,")
+        self.assertIn(b"SIZE 14 mm,40 mm\r\nGAP 5 mm,0 mm\r\n", prefix)
+        self.assertEqual(ink_and_print, b"\x7f" + b"\xff" * 3839 + b"\r\nPRINT 1\r\n")
+
+    def test_detection_uses_only_queries_and_rejects_mismatched_stock(self):
+        replies = [self.config, b"\x00", self.tag]
+        with (patch("stupid_print.printer.serial.Serial") as serial,
+              patch("stupid_print.printer.time.sleep"),
+              patch.object(P21, "_read", side_effect=replies)):
+            serial.return_value.write.side_effect = len
+            with connect_printer(PrinterPort("COM5", "P21_1234")) as (printer, status):
+                self.assertIsInstance(printer, P21)
+                self.assertEqual(status.roll.length, 40)
+                self.assertFalse(status.issue)
+                with self.assertRaisesRegex(ValueError, "loaded roll"):
+                    printer.validate_stock(new_document(), status)
+                doc = new_document()
+                doc["height"] = 14
+                printer.validate_stock(doc, status)
+            writes = [call.args[0] for call in serial.return_value.write.call_args_list]
+            self.assertEqual(writes, [b"\r\nCONFIG?\r\n", P21_STATUS, P21_ROLL])
+
+    def test_generic_port_can_fall_back_to_nelko_without_a_name(self):
+        with (patch("stupid_print.printer.serial.Serial") as serial,
+              patch("stupid_print.printer.time.sleep"),
+              patch.object(D30, "_read", return_value=b""),
+              patch.object(P21, "_read", side_effect=[self.config, b"\x00", self.tag])):
+            serial.return_value.write.side_effect = len
+            with connect_printer(PrinterPort("/dev/rfcomm1")) as (printer, status):
+                self.assertIsInstance(printer, P21)
+                self.assertEqual(status.roll, LabelRoll(40, 14, "Gap labels", 5))
+            self.assertEqual([call.kwargs["baudrate"] for call in serial.call_args_list], [9600, 115200])
+
+    def test_nelko_job_is_sent_once_and_waits_for_ready(self):
+        doc = new_document()
+        doc["height"] = 14
+        printer = P21("COM5")
+        status = SimpleNamespace(roll=_label_roll(self.tag))
+        image = render_label(doc, Batch(doc), 0)
+        with (patch.object(printer, "_write") as write,
+              patch.object(printer, "_read", return_value=b""),
+              patch.object(printer, "_query", side_effect=[b"\x20", b"\x00"]) as query,
+              patch("stupid_print.printer.time.sleep")):
+            printer.print_image(image, doc, status)
+        self.assertEqual(write.call_count, 1)
+        self.assertTrue(write.call_args.args[0].endswith(b"\r\nPRINT 1\r\n"))
+        self.assertEqual(query.call_count, 2)
 
 
 if __name__ == "__main__":

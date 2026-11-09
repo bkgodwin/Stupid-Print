@@ -133,6 +133,7 @@ class BatchList(ttk.Frame):
         self.tree.column("summary", width=200)
         self.tree.bind("<<TreeviewSelect>>", self._preview)
         self.on_toggle = lambda: None
+        self.can_toggle = lambda: True
 
     def set_batch(self, batch, number=1):
         self.batch = batch
@@ -200,6 +201,8 @@ class BatchList(ttk.Frame):
         return "break"
 
     def _toggle(self, row):
+        if not self.can_toggle():
+            return
         number = int(row)
         self.selection.toggle(number)
         self.tree.set(row, "picked", "✓" if number in self.selection else "○")

@@ -8,9 +8,9 @@ from tkinter import messagebox, simpledialog, ttk
 
 from PIL import Image, ImageTk
 
-from .model import Batch, Selection
-from .printer import D30
-from .render import raster_packet, render_label
+from .model import Batch, Selection, dimensions
+from .printer import connect_printer
+from .render import DPI, render_label
 from .widgets import BatchList, button, field
 
 
@@ -83,12 +83,16 @@ class BatchSetup(SettingsDialog):
 
 
 class PrintDialog(tk.Toplevel):
-    def __init__(self, app, batch, current):
+    def __init__(self, app, batch, current, port):
         super().__init__(app.root)
         self.app = app
         self.batch = batch
+        self.port = port
         self.selection = Selection([(current, current)])
         self.status = tk.StringVar(value="Choose labels in the list, or add a range.")
+        roll = app.loaded_roll if app.checked_device == port.device else None
+        if roll and (dimensions(batch.doc) != (roll.length, roll.width) or batch.doc["media"] != roll.media):
+            self.status.set(f"Last detected roll is {roll.description}. Use loaded roll in the editor to match it.")
         self.total = tk.StringVar()
         self.copies = tk.StringVar(value="1")
         self.expression = tk.StringVar()
@@ -108,12 +112,15 @@ class PrintDialog(tk.Toplevel):
         body = ttk.Frame(self, padding=17)
         body.pack(fill="both", expand=True)
         ttk.Label(body, text="Print labels", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(body, text=f"{batch.doc['title']} · {app.port.get()}",
+        printer = app.printer_model if app.checked_device == port.device else ""
+        target = f"{printer} · {port.device}" if printer else port.display
+        ttk.Label(body, text=f"{batch.doc['title']} · {target} · Print dots at {DPI} DPI",
                   style="Muted.TLabel").pack(anchor="w", pady=(1, 11))
         self.preview = ttk.Label(body, anchor="center", padding=(7, 8))
         self.preview.pack(fill="x")
         self.list = BatchList(body, self.show_preview, self.selection)
         self.list.on_toggle = self.update_count
+        self.list.can_toggle = lambda: self.stop is None
         self.list.pack(fill="both", expand=True, pady=(4, 10))
         controls = ttk.Frame(body)
         controls.pack(fill="x")
@@ -163,7 +170,7 @@ class PrintDialog(tk.Toplevel):
         if self.stop is not None:
             return
         self.selection.ranges = [(1, self.batch.count)] if select else []
-        self.list.show()
+        self.refresh_selection()
         self.update_count()
 
     def add_range(self):
@@ -174,9 +181,13 @@ class PrintDialog(tk.Toplevel):
         except ValueError as exc:
             self.status.set(str(exc))
             return
-        self.list.show()
+        self.refresh_selection()
         self.update_count()
         self.status.set("Range added to the selection.")
+
+    def refresh_selection(self):
+        focused = self.list.tree.selection()
+        self.list.show(focus=int(focused[0]) if focused else None)
 
     def start(self):
         try:
@@ -196,7 +207,7 @@ class PrintDialog(tk.Toplevel):
         self.close_button.configure(text="Stop after current label")
         self.progress.configure(value=0)
         selection = Selection(self.selection.ranges.copy())
-        thread = threading.Thread(target=self._print, args=(self.app.port.get().strip(), selection, copies),
+        thread = threading.Thread(target=self._print, args=(self.port, selection, copies),
                                   daemon=True)
         thread.start()
         self.after(100, self._poll)
@@ -205,6 +216,7 @@ class PrintDialog(tk.Toplevel):
         done = 0
         total = selection.count * copies
         number = 0
+        confirms_print = True
         try:
             # Validate before the first physical write, including every variable barcode.
             latest = 0.0
@@ -219,29 +231,32 @@ class PrintDialog(tk.Toplevel):
             if self.stop.is_set():
                 self.events.put(("end", "Stopped before printing."))
                 return
-            continuous = self.batch.doc["media"] == "Continuous tape"
-            with D30(port) as printer:
-                status = printer.status()
+            number = 0
+            with connect_printer(port) as (printer, status):
                 if status.issue:
                     raise OSError(status.issue)
+                printer.validate_stock(self.batch.doc, status)
+                confirms_print = printer.confirms_print
                 for number in selection:
                     if self.stop.is_set():
                         break
-                    packet = raster_packet(render_label(self.batch.doc, self.batch, number - 1), continuous)
+                    image = render_label(self.batch.doc, self.batch, number - 1)
                     for _ in range(copies):
                         if self.stop.is_set():
                             break
                         self.events.put(("status", f"Printing label {number:,} · {done + 1:,}/{total:,}"))
-                        printer.print_label(packet, continuous)
+                        printer.print_image(image, self.batch.doc, status)
                         done += 1
                         self.events.put(("progress", done / total))
-            result = f"Printed {done:,} of {total:,} labels." if done == total else (
-                f"Stopped after {done:,} of {total:,} labels."
-            )
+            verb = "Printed" if confirms_print else "Sent"
+            result = f"{verb} {done:,} of {total:,} labels."
+            if done != total:
+                result = "Stopped. " + result
             self.events.put(("end", result))
         except (OSError, ValueError, TypeError, KeyError) as exc:
             label = f"Label {number:,}: " if number else ""
-            self.events.put(("end", f"{label}{exc} ({done:,} confirmed.)"))
+            completed = "confirmed" if confirms_print else "sent with printer ready"
+            self.events.put(("end", f"{label}{exc} ({done:,} {completed}.)"))
 
     def _poll(self):
         while True:
