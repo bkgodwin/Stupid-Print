@@ -3,6 +3,7 @@
 import base64
 import io
 import math
+from pathlib import Path
 import re
 import struct
 import unicodedata
@@ -14,7 +15,7 @@ from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps, features
 
 from .artwork import EMOJI_GRAPHICS, graphic_layer, vector_image
 from .fonts import font_catalog, select_font as _font
-from .model import dimensions
+from .model import MAX_DATA_BYTES, MAX_LABEL_TEXT, dimensions
 
 
 DPI = 203
@@ -333,18 +334,33 @@ def _matrix_image(item, value, size):
 
 
 def embed_image(path):
-    with Image.open(path) as source:
-        image = ImageOps.exif_transpose(source).convert("RGBA")
-        image.thumbnail((1600, 1200), Image.Resampling.LANCZOS)
-        stream = io.BytesIO()
-        image.save(stream, format="PNG", optimize=True)
+    path = Path(path)
+    if path.stat().st_size > MAX_DATA_BYTES:
+        raise ValueError("Images must be 32 MB or smaller.")
+    try:
+        with Image.open(path, formats=("PNG", "JPEG", "BMP", "GIF", "WEBP", "TIFF")) as source:
+            if source.width * source.height > 32_000_000:
+                raise ValueError("Resize the image to 32 megapixels or smaller.")
+            image = ImageOps.exif_transpose(source).convert("RGBA")
+            image.thumbnail((1600, 1200), Image.Resampling.LANCZOS)
+            stream = io.BytesIO()
+            image.save(stream, format="PNG", optimize=True)
+    except Image.DecompressionBombError as exc:
+        raise ValueError("Resize the image to 32 megapixels or smaller.") from exc
     return base64.b64encode(stream.getvalue()).decode("ascii")
 
 
-@lru_cache(maxsize=12)
+@lru_cache(maxsize=4)
 def _read_image(encoded):
-    with Image.open(io.BytesIO(base64.b64decode(encoded, validate=True))) as source:
-        return source.convert("RGBA")
+    if len(encoded) > 12 * 1024 * 1024:
+        raise ValueError("Embedded artwork is too large. Replace it with a smaller image.")
+    try:
+        with Image.open(io.BytesIO(base64.b64decode(encoded, validate=True)), formats=("PNG",)) as source:
+            if max(source.size) > 1600 or min(source.size) > 1200:
+                raise ValueError("Embedded artwork exceeds the supported size. Replace the image.")
+            return source.convert("RGBA")
+    except Image.DecompressionBombError as exc:
+        raise ValueError("Embedded artwork is too large. Replace the image.") from exc
 
 
 def _picture(item, size, smooth=False):
@@ -397,6 +413,8 @@ def render_label(doc, batch, index, *, smooth=False):
         display_size = (size[0] * scale, size[1] * scale)
         if kind == "text":
             value = batch.expand(item["value"], context)
+            if len(value) > MAX_LABEL_TEXT:
+                raise ValueError(f"Label text must be {MAX_LABEL_TEXT:,} characters or fewer after field expansion.")
             rotation = item.get("rotation", "0°")
             text_size = size[::-1] if rotation in ("90°", "270°") else size
             layer = _text_image(item, value, text_size, smooth=smooth)
@@ -407,6 +425,8 @@ def render_label(doc, batch, index, *, smooth=False):
                     or y + display_size[1] > min(height, margin + head)):
                 raise ValueError("Move the barcode box inside the printable area.")
             value = batch.expand(item["value"], context)
+            if len(value) > 3000:
+                raise ValueError("Shorten the barcode value to fit the label.")
             if kind == "matrix":
                 layer, bars = _matrix_image(item, value, size), size[1]
             else:

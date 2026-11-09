@@ -5,16 +5,27 @@ import ipaddress
 import json
 import os
 import re
+import sys
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 from uuid import uuid4
+from zipfile import ZIP_DEFLATED, ZIP_STORED, BadZipFile, ZipFile
 
 from .artwork import GRAPHICS
 
 
 EXTENSION = ".stupidprint"
+MAX_DOCUMENT_BYTES = 64 * 1024 * 1024
+MAX_DATA_BYTES = 32 * 1024 * 1024
+MAX_WORKBOOK_BYTES = 128 * 1024 * 1024
+MAX_DATA_ROWS = 100_000
+MAX_DATA_CELLS = 1_000_000
+MAX_COLUMNS = 1024
+MAX_ELEMENTS = 256
+MAX_LABEL_TEXT = 8192
 TOKEN = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
 DATE_OFFSET = re.compile(r"date([+-]\d+)d")
 DATE_FORMATS = {"YYYY-MM-DD": "%Y-%m-%d", "MM/DD/YYYY": "%m/%d/%Y",
@@ -65,6 +76,9 @@ def app_directory():
     if override := os.environ.get("STUPID_PRINT_DATA_DIR"):
         return Path(override).expanduser()
     if os.name == "nt":
+        bundle = Path(sys.executable).parent
+        if getattr(sys, "frozen", False) and (bundle / "portable.flag").is_file():
+            return bundle / "Stupid Print Data"
         return Path(os.environ.get("LOCALAPPDATA", Path.home())) / "Stupid Print"
     return Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "stupid-print"
 
@@ -80,6 +94,8 @@ def write_json(path, value):
             json.dump(value, stream, ensure_ascii=False, separators=(",", ":"))
             stream.write("\n")
             stream.flush()
+            if stream.tell() > MAX_DOCUMENT_BYTES:
+                raise ValueError("The project exceeds 64 MB. Remove unused artwork or imported rows.")
             os.fsync(stream.fileno())
         temp.replace(path)
     finally:
@@ -88,8 +104,14 @@ def write_json(path, value):
 
 
 def read_document(path):
-    with Path(path).open(encoding="utf-8") as stream:
-        doc = json.load(stream)
+    try:
+        with Path(path).open("rb") as stream:
+            raw = stream.read(MAX_DOCUMENT_BYTES + 1)
+        if len(raw) > MAX_DOCUMENT_BYTES:
+            raise ValueError("Projects must be 64 MB or smaller.")
+        doc = json.loads(raw)
+    except RecursionError as exc:
+        raise ValueError("The project file is nested too deeply.") from exc
     if not isinstance(doc, dict) or doc.get("version") != 1:
         raise ValueError("This file is not a supported Stupid Print document.")
     if not isinstance(doc.get("title"), str) or doc.get("kind") not in ("project", "template"):
@@ -105,7 +127,7 @@ def read_document(path):
             raise ValueError("Invalid border weight.")
         doc["border_width"] = round(border_width)
         used = set()
-        if not isinstance(doc["elements"], list):
+        if not isinstance(doc["elements"], list) or len(doc["elements"]) > MAX_ELEMENTS:
             raise ValueError("Invalid label elements.")
         for item in doc["elements"]:
             validate_element(item, used)
@@ -117,19 +139,20 @@ def read_document(path):
         headers, rows = data["headers"], data["rows"]
         if not isinstance(data["name"], str) or not isinstance(headers, list) or not isinstance(rows, list):
             raise ValueError("Invalid imported data.")
+        _check_table_size(len(rows), len(headers))
         if any(not isinstance(header, str) for header in headers) or len(set(headers)) != len(headers):
             raise ValueError("Invalid column names.")
         if any(not isinstance(row, list) or len(row) != len(headers)
                or any(not isinstance(value, str) for value in row) for row in rows):
             raise ValueError("Invalid imported rows.")
-    except (KeyError, TypeError) as exc:
+    except (KeyError, TypeError, OverflowError) as exc:
         raise ValueError("The document has missing or invalid settings.") from exc
     return doc
 
 
 def validate_element(item, used):
     uid = item["id"]
-    if not isinstance(uid, str) or not uid or uid in used:
+    if not isinstance(uid, str) or not uid or len(uid) > 128 or "\x00" in uid or uid in used:
         raise ValueError("Invalid element identifier.")
     used.add(uid)
     for key, low, high in (("x", 0, 200), ("y", 0, 15), ("w", 0.2, 200), ("h", 0.2, 15)):
@@ -137,7 +160,9 @@ def validate_element(item, used):
         if not low <= item[key] <= high:
             raise ValueError("Invalid element dimensions.")
     kind = item["kind"]
-    if kind in ("text", "barcode", "matrix") and not isinstance(item["value"], str):
+    if kind in ("text", "barcode", "matrix") and (
+        not isinstance(item["value"], str) or len(item["value"]) > MAX_LABEL_TEXT
+    ):
         raise ValueError("Invalid element text.")
     if kind == "text":
         item.setdefault("rotation", "0°")
@@ -182,37 +207,70 @@ class Library:
         doc_id = doc["id"]
         if not re.fullmatch(r"[0-9a-f]{32}", doc_id):
             raise ValueError("Invalid library document identifier.")
-        write_json(self.path / doc["kind"] / (doc_id + EXTENSION), doc)
+        if doc["kind"] not in ("project", "template"):
+            raise ValueError("Invalid library document type.")
+        path = self.path / doc["kind"] / (doc_id + EXTENSION)
+        write_json(path, doc)
+        return path
 
     def list(self):
-        return sorted(
-            (path for path in self.path.glob(f"*/*{EXTENSION}")
-             if path.parent.name in ("project", "template")),
-            key=lambda path: path.stat().st_mtime, reverse=True,
-        )
+        entries = []
+        for path in self.path.glob(f"*/*{EXTENSION}"):
+            if path.parent.name not in ("project", "template"):
+                continue
+            try:
+                entries.append((path.stat().st_mtime_ns, path))
+            except OSError:
+                continue
+        return [path for _, path in sorted(entries, reverse=True)]
 
     def settings(self):
         path = self.path / "settings.json"
         try:
-            settings = json.loads(path.read_text(encoding="utf-8"))
-            return settings if isinstance(settings, dict) else {}
-        except (OSError, ValueError):
+            with path.open("rb") as stream:
+                settings = json.loads(stream.read(1024 * 1024 + 1))
+        except (OSError, ValueError, RecursionError):
             return {}
+        if not isinstance(settings, dict):
+            return {}
+        for key in ("port", "last", "active_profile", "theme"):
+            if not isinstance(settings.get(key), str):
+                settings.pop(key, None)
+        profiles = settings.get("profiles", {})
+        settings["profiles"] = {
+            name: profile for name, profile in profiles.items()
+            if isinstance(profile, dict) and isinstance(profile.get("port"), str)
+            and isinstance(profile.get("model"), str) and isinstance(profile.get("width"), (int, float))
+            and 5 <= profile["width"] <= 15
+        } if isinstance(profiles, dict) else {}
+        return settings
 
     def save_settings(self, settings):
         write_json(self.path / "settings.json", settings)
 
 
+def _check_table_size(rows, columns):
+    if columns > MAX_COLUMNS or rows > MAX_DATA_ROWS or rows * columns > MAX_DATA_CELLS:
+        raise ValueError("Imported data is too large. Use up to 100,000 rows, 1,024 columns and one million cells.")
+
+
 def _data(name, records):
-    iterator = iter(records)
-    first = next((row for row in iterator if any(value.strip() for value in row)), None)
+    iterator = enumerate(records, 1)
+    first = None
+    for line, row in iterator:
+        _check_table_size(line - 1, 0)
+        if any(value.strip() for value in row):
+            first = row
+            break
     if not first:
         raise ValueError("The data file needs a header row.")
     headers = [value.strip() or f"Column {i}" for i, value in enumerate(first, 1)]
+    _check_table_size(1, len(headers))
     if len(headers) != len(set(headers)) or any("{" in h or "}" in h for h in headers):
         raise ValueError("Column names must be unique and cannot contain braces.")
     rows = []
-    for row in iterator:
+    for line, row in iterator:
+        _check_table_size(line - 1, len(headers))
         if not any(value.strip() for value in row):
             continue
         if any(row[len(headers):]):
@@ -223,14 +281,40 @@ def _data(name, records):
     return {"name": name, "headers": headers, "rows": rows}
 
 
-def excel_sheets(path):
+@contextmanager
+def _workbook(path):
+    from defusedxml.common import DefusedXmlException
     from openpyxl import load_workbook
+    from openpyxl.utils.exceptions import InvalidFileException
+    from xml.etree.ElementTree import ParseError
 
-    book = load_workbook(path, read_only=True, data_only=True, keep_links=False)
     try:
+        with Path(path).open("rb") as stream:
+            if os.fstat(stream.fileno()).st_size > MAX_DATA_BYTES:
+                raise ValueError("Data files must be 32 MB or smaller.")
+            with ZipFile(stream) as archive:
+                members = archive.infolist()
+                if len(members) > 2048 or sum(info.file_size for info in members) > MAX_WORKBOOK_BYTES:
+                    raise ValueError("The Excel workbook is too large after decompression.")
+                if any(info.compress_type not in (ZIP_STORED, ZIP_DEFLATED) or info.flag_bits & 1 for info in members):
+                    raise ValueError("Use a standard, unencrypted Excel workbook.")
+            stream.seek(0)
+            try:
+                book = load_workbook(stream, read_only=True, data_only=True, keep_links=False)
+            except ValueError as exc:
+                # openpyxl wraps errors from the guarded XML parser in ValueError.
+                raise ValueError("This Excel file is damaged or contains unsupported content.") from exc
+            try:
+                yield book
+            finally:
+                book.close()
+    except (BadZipFile, DefusedXmlException, InvalidFileException, ParseError, IndexError, OverflowError) as exc:
+        raise ValueError("This Excel file is damaged or contains unsupported content.") from exc
+
+
+def excel_sheets(path):
+    with _workbook(path) as book:
         return book.sheetnames
-    finally:
-        book.close()
 
 
 def _cell_text(cell):
@@ -249,17 +333,19 @@ def _cell_text(cell):
 def import_data(path, sheet=None):
     path = Path(path)
     if path.suffix.lower() in (".xlsx", ".xlsm"):
-        from openpyxl import load_workbook
-
-        book = load_workbook(path, read_only=True, data_only=True, keep_links=False)
-        try:
+        with _workbook(path) as book:
             tab = book[sheet] if sheet else book.active
+            if tab is None or not hasattr(tab, "iter_rows"):
+                raise ValueError("Choose an Excel worksheet with data.")
+            _check_table_size(0, tab.max_column or 0)
+            # Worksheet dimensions can include a large formatted but empty range.
+            tab.reset_dimensions()
             return _data(f"{path.name} / {tab.title}",
                          ([_cell_text(cell) for cell in row] for row in tab.iter_rows()))
-        finally:
-            book.close()
     if path.suffix.lower() not in (".csv", ".tsv"):
         raise ValueError("Select a CSV, TSV, XLSX or XLSM file.")
+    if path.stat().st_size > MAX_DATA_BYTES:
+        raise ValueError("Data files must be 32 MB or smaller.")
     for encoding in ("utf-8-sig", "cp1252"):
         try:
             with path.open(encoding=encoding, newline="") as stream:
@@ -270,6 +356,8 @@ def import_data(path, sheet=None):
                 except csv.Error:
                     dialect = csv.excel_tab if path.suffix.lower() == ".tsv" else csv.excel
                 return _data(path.name, csv.reader(stream, dialect))
+        except csv.Error as exc:
+            raise ValueError(f"Could not read the data file: {exc}") from exc
         except UnicodeDecodeError:
             if encoding == "cp1252":
                 raise

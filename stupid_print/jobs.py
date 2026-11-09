@@ -2,9 +2,12 @@
 
 import csv
 import json
+import os
 import sqlite3
+import tempfile
 from contextlib import contextmanager
 from datetime import datetime
+from pathlib import Path
 from uuid import uuid4
 
 from .model import dimensions
@@ -19,7 +22,14 @@ class JobStore:
 
     @contextmanager
     def connect(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if os.name == "posix":
+            # The replay snapshot may include imported data and QR payloads.
+            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+            finally:
+                os.close(fd)
         db = sqlite3.connect(self.path)
         db.row_factory = sqlite3.Row
         try:
@@ -77,13 +87,27 @@ class JobStore:
             return db.execute("SELECT 1 FROM jobs WHERE snapshot IS NOT NULL LIMIT 1").fetchone() is not None
 
     def export_csv(self, path):
-        with self.connect() as db, open(path, "w", encoding="utf-8-sig", newline="") as stream:
-            writer = csv.writer(stream)
-            writer.writerow(JOB_FIELDS)
-            for row in db.execute(f"SELECT {', '.join(JOB_FIELDS)} FROM jobs ORDER BY rowid DESC"):
-                # Prevent spreadsheet apps from treating user-supplied strings as formulas.
-                writer.writerow("'" + value if isinstance(value, str) and value.startswith(
-                    ("=", "+", "-", "@", "\t", "\r", "\n")) else value for value in row)
+        path = Path(path)
+        if path.resolve() == self.path.resolve():
+            raise OSError("Choose a CSV file outside the print history database.")
+        temp = None
+        try:
+            with self.connect() as db, tempfile.NamedTemporaryFile(
+                mode="w", dir=path.parent, encoding="utf-8-sig", newline="", delete=False,
+            ) as stream:
+                temp = Path(stream.name)
+                writer = csv.writer(stream)
+                writer.writerow(JOB_FIELDS)
+                for row in db.execute(f"SELECT {', '.join(JOB_FIELDS)} FROM jobs ORDER BY rowid DESC"):
+                    # Spreadsheet applications can ignore leading whitespace before a formula.
+                    writer.writerow("'" + value if isinstance(value, str) and (
+                        value.startswith(("\t", "\r", "\n"))
+                        or value.lstrip().startswith(("=", "+", "-", "@", "＝", "＋", "－", "＠"))
+                    ) else value for value in row)
+            temp.replace(path)
+        finally:
+            if temp is not None:
+                temp.unlink(missing_ok=True)
 
     @staticmethod
     def stock_key(port, doc):

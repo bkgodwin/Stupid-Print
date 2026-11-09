@@ -6,7 +6,7 @@ import select
 import socket
 import threading
 import time
-from contextlib import asynccontextmanager, contextmanager, suppress
+from contextlib import ExitStack, asynccontextmanager, contextmanager, suppress
 from dataclasses import dataclass
 
 from dbus_fast import BusType, Message, MessageType, Variant
@@ -23,6 +23,12 @@ SCAN_SECONDS = 4
 
 
 class BluetoothError(OSError):
+    def __init__(self, message, *, code=""):
+        super().__init__(message)
+        self.code = code
+
+
+class SerialProfileUnavailable(BluetoothError):
     pass
 
 
@@ -53,12 +59,12 @@ def _inventory(objects):
         address = _value(props, "Address")
         if not address:
             continue
+        serial_port = any(uuid.lower() == SPP for uuid in _value(props, "UUIDs", []))
         devices.append(BluetoothDevice(
             path, address.upper(), _value(props, "Name", ""), _value(props, "Alias", ""),
             _value(props, "Paired", False) or _value(props, "Bonded", False),
             adapters.get(_value(props, "Adapter"), False),
-            any(uuid.lower() == SPP for uuid in _value(props, "UUIDs", [])),
-            _value(props, "AddressType") != "random",
+            serial_port, serial_port or _value(props, "AddressType") != "random",
         ))
     return adapters, devices
 
@@ -98,7 +104,7 @@ async def _call(bus, path, interface, member, signature="", body=None, *, timeou
                                 "org.freedesktop.DBus.Error.NameHasNoOwner"):
             raise BluetoothError("Linux Bluetooth service (BlueZ) is unavailable. Check Bluetooth in system settings.")
         detail = str(reply.body[0]) if reply.body else reply.error_name
-        raise BluetoothError(detail)
+        raise BluetoothError(detail, code=reply.error_name)
     return reply
 
 
@@ -149,6 +155,34 @@ def discover(scan=False):
         return [], "Linux Bluetooth did not respond. Check Bluetooth in system settings and try again."
     except OSError as exc:
         return [], str(exc)
+
+
+async def _pair(address):
+    async with _system_bus() as bus:
+        _, devices = _inventory((await _managed_objects(bus)).body[0])
+        candidates = [device for device in devices if device.address == address and device.powered and device.classic]
+        if not candidates:
+            raise BluetoothError("Wake the printer and click Find printers to scan for its Bluetooth Classic entry.")
+        if any(device.paired for device in candidates):
+            return
+        device = candidates[0]
+        try:
+            await _call(bus, device.path, DEVICE, "Pair", timeout=35)
+        except TimeoutError:
+            with suppress(OSError):
+                await _call(bus, device.path, DEVICE, "CancelPairing")
+            raise
+        except BluetoothError as exc:
+            if exc.code != BLUEZ + ".Error.AlreadyExists":
+                raise
+
+
+def pair(address):
+    try:
+        asyncio.run(_pair(address))
+    except OSError as exc:
+        raise BluetoothError(f"Pairing did not finish. Pair the printer in Linux Bluetooth settings, "
+                             f"then click Find printers. ({exc})") from exc
 
 
 class _RfcommStream:
@@ -246,9 +280,13 @@ async def _rfcomm_session(address):
                 await asyncio.wait_for(received.wait(), 3)
             except (OSError, asyncio.TimeoutError) as exc:
                 detail = str(exc) or "connection timed out"
-                if "profile-unavailable" in detail:
-                    raise BluetoothError("BlueZ could not find the printer’s serial service. "
-                                         "Pair the Bluetooth Classic entry in Linux Bluetooth settings.") from exc
+                if "profile-unavailable" in detail or (
+                    isinstance(exc, BluetoothError) and exc.code in (
+                        BLUEZ + ".Error.NotAvailable", BLUEZ + ".Error.NotSupported",
+                    )
+                ):
+                    raise SerialProfileUnavailable("BlueZ could not find the printer’s serial service. "
+                                                   "Pair its Bluetooth Classic entry in system settings.") from exc
                 raise BluetoothError(f"Could not open Bluetooth serial ({detail}). "
                                      "Wake the printer, close its phone app, and check again.") from exc
             if connection is None:
@@ -264,7 +302,7 @@ async def _rfcomm_session(address):
 
 
 @contextmanager
-def open_rfcomm(address):
+def _bluez_rfcomm(address):
     # BlueZ can request disconnection while the printer worker is doing synchronous I/O.
     loop = asyncio.new_event_loop()
     thread = threading.Thread(target=loop.run_forever, daemon=True)
@@ -280,3 +318,26 @@ def open_rfcomm(address):
         loop.call_soon_threadsafe(loop.stop)
         thread.join()
         loop.close()
+
+
+@contextmanager
+def open_rfcomm(address, *, p21=False):
+    # The captured P21 protocol uses RFCOMM channel 1. Some devices can
+    # accept that channel even when BlueZ has no cached serial service.
+    with ExitStack() as connections:
+        try:
+            stream = connections.enter_context(_bluez_rfcomm(address))
+        except SerialProfileUnavailable:
+            if not p21:
+                raise
+            try:
+                conn = connections.enter_context(socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM,
+                                                              socket.BTPROTO_RFCOMM))
+                conn.settimeout(10)
+                conn.connect((address, 1))
+            except (AttributeError, OSError) as exc:
+                raise BluetoothError("Could not open the P21’s Bluetooth serial channel. Wake the printer, "
+                                     "disconnect the Nelko phone app, and check that it is paired via "
+                                     "Bluetooth Classic.") from exc
+            stream = _RfcommStream(conn)
+        yield stream

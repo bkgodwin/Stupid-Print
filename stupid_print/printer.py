@@ -35,6 +35,7 @@ class PrinterPort:
     name: str = ""
     protocol: str = ""
     issue: str = ""
+    pairable: bool = False
 
     @property
     def display(self):
@@ -128,7 +129,8 @@ def _bluetooth_ports(devices):
         name = device.alias or device.name or "Bluetooth serial device"
         score = (not issue, device.paired, device.powered, device.serial_port, bool(hint))
         if key not in ranked or score > ranked[key][0]:
-            ranked[key] = score, PrinterPort(key, name, hint, issue)
+            pairable = bool(hint and device.powered and device.classic and not device.paired)
+            ranked[key] = score, PrinterPort(key, name, hint, issue, pairable)
     return {key: port for key, (_, port) in sorted(ranked.items(), key=lambda item: item[1][1].display.casefold())}
 
 
@@ -146,6 +148,12 @@ def discover_printers(scan=False):
     except ImportError:
         return ports, "Bluetooth discovery support is missing. Run ./start.sh to update the app’s dependencies."
     return {**_bluetooth_ports(devices), **ports}, note or serial_note
+
+
+def pair_printer(port):
+    from .linux_bluetooth import pair
+
+    pair(port.bluetooth_address)
 
 
 def suggested_port(ports):
@@ -418,7 +426,7 @@ def connect_printer(port):
             from .linux_bluetooth import open_rfcomm
         except ImportError as exc:
             raise OSError("Run ./start.sh to install Linux Bluetooth support.") from exc
-        transport = open_rfcomm(address)
+        transport = open_rfcomm(address, p21=True) if port.hint == "P21" else open_rfcomm(address)
     drivers = {"D30": (D30,), "P21": (P21,)}.get(port.hint, (D30, P21))
     with transport as stream:
         for driver in drivers:

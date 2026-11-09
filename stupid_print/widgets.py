@@ -97,6 +97,40 @@ def tree_with_scroll(parent, columns, **kwargs):
     return frame, tree
 
 
+class ScrollPanel(ttk.Frame):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        background = ttk.Style(self).lookup("TFrame", "background")
+        self.canvas = tk.Canvas(self, width=284, height=260, highlightthickness=0, background=background)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.scrollbar.grid(row=0, column=1, sticky="ns")
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.content = ttk.Frame(self.canvas, padding=9)
+        self.window = self.canvas.create_window((0, 0), window=self.content, anchor="nw")
+        self.canvas.bind("<Configure>", self.resize)
+        self.content.bind("<Configure>", self.resize)
+        self.bind("<Map>", self.resize)
+
+    def resize(self, _):
+        self.canvas.itemconfigure(self.window, width=max(1, self.canvas.winfo_width()))
+        self.canvas.configure(scrollregion=(0, 0, self.canvas.winfo_width(), self.content.winfo_reqheight()))
+        if self.content.winfo_reqheight() > self.canvas.winfo_height():
+            self.scrollbar.grid()
+        else:
+            self.scrollbar.grid_remove()
+            self.canvas.yview_moveto(0)
+
+    def scroll(self, event):
+        if not self.scrollbar.winfo_ismapped() or not str(event.widget).startswith(str(self) + "."):
+            return
+        up = event.num == 4 or event.delta > 0
+        self.canvas.yview_scroll(-1 if up else 1, "units")
+        return "break"
+
+
 class BatchList(ttk.Frame):
     page_size = 150
 
@@ -110,9 +144,9 @@ class BatchList(ttk.Frame):
         self.caption = tk.StringVar(value="No batch")
         controls = ttk.Frame(self)
         controls.pack(fill="x", pady=(0, 6))
-        self.previous = button(controls, "‹", lambda: self.change_page(-1), width=3)
+        self.previous = button(controls, "<", lambda: self.change_page(-1), width=3)
         self.previous.pack(side="left")
-        self.next = button(controls, "›", lambda: self.change_page(1), width=3)
+        self.next = button(controls, ">", lambda: self.change_page(1), width=3)
         self.next.pack(side="left", padx=(3, 8))
         ttk.Label(controls, textvariable=self.caption, style="Muted.TLabel").pack(side="left")
         button(controls, "Go", self.jump, width=4).pack(side="right")
@@ -167,7 +201,8 @@ class BatchList(ttk.Frame):
         end = min(self.batch.count, self.start + self.page_size - 1)
         self.previous.state(["!disabled" if self.start > 1 else "disabled"])
         self.next.state(["!disabled" if end < self.batch.count else "disabled"])
-        self.caption.set(f"{self.start:,}–{end:,} of {self.batch.count:,}")
+        label_range = f"{self.start:,}" if self.start == end else f"{self.start:,}–{end:,}"
+        self.caption.set(f"{label_range} of {self.batch.count:,}")
         for number in range(self.start, end + 1):
             try:
                 summary = self.batch.summary(number - 1)

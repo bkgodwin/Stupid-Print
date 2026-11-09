@@ -13,10 +13,13 @@ from .render import render_label
 
 
 PAPER_SIZES = {"US Letter": letter, "A4": A4}
+MAX_PROOF_LABELS = 5000
 
 
 def write_proof(path, batch, paper, *, cancelled=lambda: False, progress=lambda count: None):
     """Write atomically and leave any existing file intact on failure or cancel."""
+    if batch.count > MAX_PROOF_LABELS:
+        raise ValueError(f"PDF proofs support up to {MAX_PROOF_LABELS:,} labels. Reduce the batch count and try again.")
     path = Path(path)
     page = PAPER_SIZES[paper]
     length, width = dimensions(batch.doc)
@@ -36,6 +39,7 @@ def write_proof(path, batch, paper, *, cancelled=lambda: False, progress=lambda 
         canvas = Canvas(str(temp), pagesize=page, pageCompression=1)
         canvas.setTitle(batch.doc["title"] + " - Batch proof")
         canvas.setAuthor("Stupid Print")
+        artwork = None
         for index in range(batch.count):
             if cancelled():
                 return False
@@ -52,11 +56,12 @@ def write_proof(path, batch, paper, *, cancelled=lambda: False, progress=lambda 
                 canvas.drawRightString(page[0] - margin, margin - 8, f"Page {index // per_page + 1} of {pages}")
             x = margin + col * (w + column_gap)
             y = page[1] - margin - header - row * (h + row_gap) - h
-            try:
-                image = render_label(batch.doc, batch, index)
-            except (ValueError, OSError, KeyError, TypeError) as exc:
-                raise ValueError(f"Label {index + 1:,} — {exc}") from exc
-            canvas.drawImage(ImageReader(image.convert("L")), x, y, w, h)
+            if artwork is None or batch.tokens:
+                try:
+                    artwork = ImageReader(render_label(batch.doc, batch, index).convert("L"))
+                except (ValueError, OSError, KeyError, TypeError) as exc:
+                    raise ValueError(f"Label {index + 1:,} — {exc}") from exc
+            canvas.drawImage(artwork, x, y, w, h)
             canvas.setStrokeColorRGB(.72, .72, .72)
             canvas.setLineWidth(.35)
             canvas.rect(x - .5, y - .5, w + 1, h + 1)

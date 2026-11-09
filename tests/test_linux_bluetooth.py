@@ -18,12 +18,13 @@ except ImportError:
 
 
 ADDRESS = "00:11:22:33:44:55"
+P21_ADDRESS = "AA:BB:CC:DD:EE:FF"
 ADAPTER_PATH = "/org/bluez/hci0"
 DEVICE_PATH = ADAPTER_PATH + "/dev_00_11_22_33_44_55"
 NEARBY_PATH = ADAPTER_PATH + "/dev_AA_BB_CC_DD_EE_FF"
 
 
-def objects(powered=True, nearby=False):
+def objects(powered=True, nearby=False, p21_paired=False):
     variant = bluez.Variant
     result = {
         ADAPTER_PATH: {bluez.ADAPTER: {"Powered": variant("b", powered)}},
@@ -35,8 +36,8 @@ def objects(powered=True, nearby=False):
     }
     if nearby:
         result[NEARBY_PATH] = {bluez.DEVICE: {
-            "Address": variant("s", "AA:BB:CC:DD:EE:FF"), "Adapter": variant("o", ADAPTER_PATH),
-            "Name": variant("s", "P21"), "Paired": variant("b", False),
+            "Address": variant("s", P21_ADDRESS), "Adapter": variant("o", ADAPTER_PATH),
+            "Name": variant("s", "P21"), "Paired": variant("b", p21_paired),
         }}
     return result
 
@@ -53,6 +54,18 @@ class InventoryTests(unittest.TestCase):
         self.assertFalse(paired.powered)
         self.assertFalse(nearby.paired)
 
+    def test_only_p21_falls_back_to_its_known_channel_when_spp_is_missing(self):
+        error = bluez.SerialProfileUnavailable("No serial service")
+        with (patch.object(bluez, "_bluez_rfcomm", side_effect=error),
+              patch.object(socket, "AF_BLUETOOTH", 31, create=True),
+              patch.object(socket, "BTPROTO_RFCOMM", 3, create=True),
+              patch.object(socket, "socket") as make_socket):
+            with self.assertRaises(bluez.SerialProfileUnavailable), bluez.open_rfcomm(ADDRESS):
+                self.fail("A generic printer should not try a guessed channel")
+            make_socket.assert_not_called()
+            with bluez.open_rfcomm(P21_ADDRESS, p21=True) as stream:
+                stream.socket.connect.assert_called_once_with((P21_ADDRESS, 1))
+
 
 @contextmanager
 def simulated_bluez(address, *, powered=True, fail_connect=False):
@@ -67,7 +80,8 @@ def simulated_bluez(address, *, powered=True, fail_connect=False):
         loop = asyncio.get_running_loop()
         stop = asyncio.Event()
         tasks = []
-        scanning = False
+        found_p21 = False
+        p21_paired = False
         profile = ""
 
         async def connect(request):
@@ -88,16 +102,17 @@ def simulated_bluez(address, *, powered=True, fail_connect=False):
                     await loop.sock_sendall(peer, b"ready")
 
         def handle(request):
-            nonlocal scanning, profile
+            nonlocal found_p21, p21_paired, profile
             if request.message_type != bluez.MessageType.METHOD_CALL:
                 return None
             calls.append(request.member)
             if request.member == "GetManagedObjects":
-                return bluez.Message.new_method_return(request, "a{oa{sa{sv}}}", [objects(powered, scanning)])
+                return bluez.Message.new_method_return(request, "a{oa{sa{sv}}}",
+                                                       [objects(powered, found_p21, p21_paired)])
             if request.member == "StartDiscovery":
-                scanning = True
-            elif request.member == "StopDiscovery":
-                scanning = False
+                found_p21 = True
+            elif request.member == "Pair" and request.path == NEARBY_PATH:
+                p21_paired = True
             elif request.member == "RegisterProfile":
                 profile, uuid, options = request.body
                 if uuid != bluez.SPP or options["Role"].value != "client":
@@ -164,6 +179,9 @@ class BluezIntegrationTests(unittest.TestCase):
             self.assertEqual(note, "")
             self.assertEqual([device.name for device in nearby], ["D30N", "P21"])
             self.assertIn("StopDiscovery", calls)
+            bluez.pair(P21_ADDRESS)
+            self.assertTrue(bluez.discover()[0][1].paired)
+            self.assertIn("Pair", calls)
             with bluez.open_rfcomm(ADDRESS) as stream:
                 self.assertEqual(stream.write(b"status"), 6)
                 self.assertEqual(stream.read(8), b"ready")

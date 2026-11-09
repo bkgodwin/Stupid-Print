@@ -2,19 +2,22 @@
 
 import queue
 import sqlite3
+import tempfile
 import threading
 import time
 import tkinter as tk
+from contextlib import contextmanager
+from itertools import islice
 from tkinter import messagebox, simpledialog, ttk
 
 from PIL import Image, ImageDraw, ImageTk
 
 from .artwork import GRAPHICS, graphic_layer
 from .fonts import font_picker_sections, select_font
-from .model import BATCH_DEFAULTS, DATE_FORMATS, MAC_FORMATS, Batch, Selection
+from .model import BATCH_DEFAULTS, DATE_FORMATS, MAC_FORMATS, Batch, Selection, dimensions
 from .printer import connect_printer
 from .proof import write_proof
-from .render import DPI, render_label
+from .render import DPI, dots, render_label
 from .widgets import BatchList, button, field, tree_with_scroll
 
 
@@ -285,6 +288,40 @@ class ProofDialog(tk.Toplevel):
         self.after(100, self.poll)
 
 
+@contextmanager
+def prepared_labels(batch, selection, stop, report):
+    """Validate every distinct label before printing and reuse the resulting rasters."""
+    width, height = map(dots, dimensions(batch.doc))
+    row_bytes = (width + 7) // 8 * height
+    if batch.tokens and row_bytes * selection.count > 256 * 1024 * 1024:
+        raise ValueError("Select a smaller range for this variable print job.")
+    with tempfile.SpooledTemporaryFile(max_size=4 * 1024 * 1024) as rasters:
+        image = None
+        numbers = selection if batch.tokens else islice(selection, 1)
+        latest = 0.0
+        for index, number in enumerate(numbers, 1):
+            if stop.is_set():
+                break
+            try:
+                image = render_label(batch.doc, batch, number - 1)
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                raise ValueError(f"Label {number:,} — {exc}") from exc
+            if batch.tokens:
+                rasters.write(image.tobytes())
+            now = time.monotonic()
+            if now - latest > .2:
+                checked = index if batch.tokens else selection.count
+                report(("status", f"Checking label {number:,} · {checked:,}/{selection.count:,}"))
+                latest = now
+        rasters.seek(0)
+        if stop.is_set():
+            yield ()
+        elif batch.tokens:
+            yield ((number, Image.frombytes("1", (width, height), rasters.read(row_bytes))) for number in selection)
+        else:
+            yield ((number, image) for number in selection)
+
+
 class PrintDialog(tk.Toplevel):
     def __init__(self, app, batch, current, port, *, ranges=None, copies=1):
         super().__init__(app.root)
@@ -456,39 +493,28 @@ class PrintDialog(tk.Toplevel):
         result = "Printing stopped unexpectedly."
         try:
             job = self.app.jobs.start(self.batch, port.device, selection, copies)
-            # Validate before the first physical write, including every variable barcode.
-            latest = 0.0
-            for index, number in enumerate(selection, 1):
+            with prepared_labels(self.batch, selection, self.stop, self.events.put) as labels:
                 if self.stop.is_set():
-                    break
-                render_label(self.batch.doc, self.batch, number - 1)
-                now = time.monotonic()
-                if now - latest > 0.2:
-                    self.events.put(("status", f"Checking label {number:,} · {index:,}/{selection.count:,}"))
-                    latest = now
-            if self.stop.is_set():
-                outcome, result = "Stopped", "Stopped before printing."
-                return
-            number = 0
-            with connect_printer(port) as (printer, status):
-                if status.issue:
-                    raise OSError(status.issue)
-                printer.validate_stock(self.batch.doc, status)
-                confirms_print = printer.confirms_print
-                for number in selection:
-                    if self.stop.is_set():
-                        break
-                    image = render_label(self.batch.doc, self.batch, number - 1)
-                    for _ in range(copies):
+                    outcome, result = "Stopped", "Stopped before printing."
+                    return
+                with connect_printer(port) as (printer, status):
+                    if status.issue:
+                        raise OSError(status.issue)
+                    printer.validate_stock(self.batch.doc, status)
+                    confirms_print = printer.confirms_print
+                    for number, image in labels:
                         if self.stop.is_set():
                             break
-                        if done == 0:
-                            self.app.jobs.remember(job, self.batch, selection, copies, printer.model)
-                        self.events.put(("status", f"Printing label {number:,} · {done + 1:,}/{total:,}"))
-                        printer.print_image(image, self.batch.doc, status)
-                        done += 1
-                        self.app.jobs.record_label(job, port.device, self.batch.doc)
-                        self.events.put(("progress", done / total))
+                        for _ in range(copies):
+                            if self.stop.is_set():
+                                break
+                            if done == 0:
+                                self.app.jobs.remember(job, self.batch, selection, copies, printer.model)
+                            self.events.put(("status", f"Printing label {number:,} · {done + 1:,}/{total:,}"))
+                            printer.print_image(image, self.batch.doc, status)
+                            done += 1
+                            self.app.jobs.record_label(job, port.device, self.batch.doc)
+                            self.events.put(("progress", done / total))
             verb = "Printed" if confirms_print else "Sent"
             result = f"{verb} {done:,} of {total:,} labels."
             if done != total:

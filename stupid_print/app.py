@@ -15,18 +15,20 @@ from uuid import uuid4
 
 from PIL import Image, ImageTk
 
+from . import __version__
 from .artwork import EMOJI_GRAPHICS, GHS_ARTWORK, GRAPHICS
 from .dialogs import BatchSetup, ChoiceDialog, FontPicker, GraphicPicker, PrintDialog, ProofDialog
 from .jobs import JobStore
-from .model import (EXTENSION, MATRIX_CODES, PRESETS, QR_LEVELS, Batch, Library, dimensions, element,
+from .model import (EXTENSION, MATRIX_CODES, MAX_ELEMENTS, MAX_LABEL_TEXT, PRESETS, QR_LEVELS,
+                    Batch, Library, dimensions, element,
                     excel_sheets, import_data, new_document, read_document, validate_element, write_json)
 from . import placement
-from .printer import PrinterPort, connect_printer, discover_printers, suggested_port
-from .printer_tools import MODELS, JobHistoryDialog, ProfilesDialog, StockDialog
+from .printer import PrinterPort, connect_printer, discover_printers, pair_printer, suggested_port
+from .printer_tools import MODELS, JobHistoryDialog, PrinterSetupDialog, ProfilesDialog, StockDialog
 from .proof import PAPER_SIZES
 from .render import BARCODES, DPI, embed_image, render_label
 from .templates import bundled_templates
-from .widgets import BatchList, button, configure_style, field, tree_with_scroll
+from .widgets import BatchList, ScrollPanel, button, configure_style, field, tree_with_scroll
 
 
 class App:
@@ -75,9 +77,11 @@ class App:
         self.history_index = 0
         self.dark = self.settings.get("theme") != "light"
         self.colors = configure_style(root, self.dark)
-        root.title("Stupid Print — Label Studio")
-        root.geometry("1300x850")
-        root.minsize(1060, 700)
+        root.title(f"Stupid Print {__version__} — Label Studio")
+        width = min(1300, max(1060, root.winfo_screenwidth() - 48))
+        height = min(850, max(620, root.winfo_screenheight() - 100))
+        root.geometry(f"{width}x{height}")
+        root.minsize(1060, 620)
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.bind("<Control-s>", lambda _: self.save())
         root.bind("<Control-n>", lambda _: self.new_project())
@@ -126,6 +130,8 @@ class App:
         edit.configure(menu=self.edit_menu)
         edit.pack(side="right")
 
+        self.footer_label = ttk.Label(self.root, textvariable=self.footer, style="App.TLabel", padding=(15, 6))
+        self.footer_label.pack(side="bottom", fill="x")
         main = ttk.Frame(self.root, style="App.TFrame", padding=(13, 13, 13, 0))
         main.pack(fill="both", expand=True)
         main.columnconfigure(1, weight=1)
@@ -139,12 +145,13 @@ class App:
         right = ttk.Frame(main, padding=8, width=285)
         right.grid(row=0, column=2, sticky="nsew", padx=(10, 0))
         self.build_inspector(right)
-        ttk.Label(self.root, textvariable=self.footer, style="App.TLabel", padding=(15, 6)).pack(fill="x")
 
     def build_library(self, parent):
+        printer_panel = ttk.Frame(parent)
+        printer_panel.pack(side="bottom", fill="x")
         ttk.Label(parent, text="Library", style="Section.TLabel").pack(anchor="w")
         ttk.Label(parent, text="Projects and starter designs", style="Muted.TLabel").pack(anchor="w", pady=(2, 8))
-        frame, self.library_tree = tree_with_scroll(parent, ("kind",), height=9, selectmode="browse")
+        frame, self.library_tree = tree_with_scroll(parent, ("kind",), height=2, selectmode="browse")
         frame.pack(fill="both", expand=True)
         self.library_tree.configure(show="tree headings")
         self.library_tree.heading("#0", text="Name")
@@ -169,13 +176,14 @@ class App:
         project.configure(menu=self.project_menu)
         project.pack(fill="x", pady=(0, 3))
 
+        parent = printer_panel
         ttk.Separator(parent).pack(fill="x", pady=12)
         self.printer_badge = ttk.Label(parent, textvariable=self.printer_title, style="Section.TLabel")
         self.printer_badge.pack(anchor="w")
         ttk.Label(parent, textvariable=self.printer_detail, wraplength=210,
                   style="Muted.TLabel").pack(fill="x", pady=(3, 8))
         self.port_field = field(parent, "Bluetooth printer / serial port", self.port, (), editable=True)
-        self.port_field.bind("<<ComboboxSelected>>", lambda _: self.check_printer())
+        self.port_field.bind("<<ComboboxSelected>>", self.printer_selected)
         self.port_field.bind("<Return>", lambda _: self.check_printer())
         actions = ttk.Frame(parent)
         actions.pack(fill="x")
@@ -183,9 +191,13 @@ class App:
         self.check_button.pack(side="left")
         self.find_button = button(actions, "Find printers", lambda: self.refresh_printers(scan=True))
         self.find_button.pack(side="left", padx=5)
-        self.use_roll_button = button(parent, "Use loaded roll", self.use_loaded_roll)
+        actions = ttk.Frame(parent)
+        actions.pack(fill="x", pady=(5, 0))
+        self.use_roll_button = button(actions, "Use loaded roll", self.use_loaded_roll, width=0)
         self.use_roll_button.state(["disabled"])
-        self.use_roll_button.pack(fill="x", pady=(5, 0))
+        self.use_roll_button.pack(side="left")
+        self.setup_button = button(actions, "Setup help…", self.open_printer_setup, width=0)
+        self.setup_button.pack(side="left", padx=(5, 0))
         actions = ttk.Frame(parent)
         actions.pack(fill="x", pady=(5, 0))
         button(actions, "Profiles…", self.open_profiles).pack(side="left")
@@ -199,12 +211,24 @@ class App:
         ttk.Label(parent, textvariable=self.subtitle, style="Muted.TLabel").pack(anchor="w", pady=(1, 9))
         toolbar = ttk.Frame(parent)
         toolbar.pack(fill="x", pady=(0, 8))
+        tools = []
         for name, action in (("+ Text", lambda: self.add_item("text")),
                              ("+ Barcode", lambda: self.add_item("barcode")),
                              ("+ 2D code", self.add_matrix),
                              ("+ Image", self.add_image), ("+ Graphic", self.add_graphic)):
-            button(toolbar, name, action, width=0).pack(side="left", padx=(0, 4))
-        self.canvas = tk.Canvas(parent, highlightthickness=0, height=188, takefocus=True)
+            control = button(toolbar, name, action, width=0, padding=(4, 5))
+            control.grid(row=0, column=len(tools), padx=(0, 2))
+            tools.append(control)
+
+        def arrange_tools(event):
+            full_width = sum(control.winfo_reqwidth() + 2 for control in tools)
+            columns = len(tools) if event.width >= full_width else 3
+            for index, control in enumerate(tools):
+                row, column = divmod(index, columns)
+                control.grid_configure(row=row, column=column)
+
+        toolbar.bind("<Configure>", arrange_tools)
+        self.canvas = tk.Canvas(parent, highlightthickness=0, height=110, takefocus=True)
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", lambda _: self.draw_stage())
         self.canvas.bind("<ButtonPress-1>", self.canvas_press)
@@ -231,9 +255,11 @@ class App:
         self.batch_toggle.pack(side="left", padx=8)
         self.batch_body = ttk.Frame(parent)
         self.batch_body.pack(fill="x")
-        ttk.Label(self.batch_body, textvariable=self.data_note, wraplength=435, style="Muted.TLabel").pack(
-            anchor="w", pady=(0, 5))
+        note = ttk.Label(self.batch_body, textvariable=self.data_note, style="Muted.TLabel")
+        note.pack(anchor="w", pady=(0, 5))
+        self.batch_body.bind("<Configure>", lambda event: note.configure(wraplength=max(180, event.width)))
         self.batch_list = BatchList(self.batch_body, self.select_batch)
+        self.batch_list.tree.configure(height=4)
         self.batch_list.pack(fill="x")
 
     def build_inspector(self, parent):
@@ -246,19 +272,23 @@ class App:
         frame.pack(fill="x")
         actions = ttk.Frame(parent)
         actions.pack(fill="x", pady=(6, 8))
-        for label, action, width in (("Duplicate", self.duplicate_item, 8), ("Remove", self.remove_item, 7),
-                                     ("Raise", lambda: self.reorder(1), 5),
-                                     ("Lower", lambda: self.reorder(-1), 5)):
-            button(actions, label, action, width=width).pack(side="left", padx=(0, 4))
+        for label, action in (("Duplicate", self.duplicate_item), ("Remove", self.remove_item),
+                              ("Raise", lambda: self.reorder(1)), ("Lower", lambda: self.reorder(-1))):
+            button(actions, label, action, width=0).pack(side="left", padx=(0, 4))
         self.tabs = ttk.Notebook(parent)
         self.tabs.pack(fill="both", expand=True)
-        self.item_panel = ttk.Frame(self.tabs, padding=9)
-        self.style_panel = ttk.Frame(self.tabs, padding=9)
-        self.place_panel = ttk.Frame(self.tabs, padding=9)
-        self.page_panel = ttk.Frame(self.tabs, padding=9)
-        for panel, title in ((self.item_panel, "Content"), (self.style_panel, "Style"),
-                             (self.place_panel, "Place"), (self.page_panel, "Label")):
+        self.inspector_tabs = {}
+        for name, title in (("item", "Content"), ("style", "Style"), ("place", "Place"), ("page", "Label")):
+            panel = ScrollPanel(self.tabs)
+            self.inspector_tabs[name] = panel
+            setattr(self, f"{name}_panel", panel.content)
             self.tabs.add(panel, text=title)
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.root.bind(sequence, self.scroll_inspector, add="+")
+
+    def scroll_inspector(self, event):
+        if selected := self.tabs.select():
+            return self.tabs.nametowidget(selected).scroll(event)
 
     def toggle_theme(self):
         self.dark = not self.dark
@@ -277,6 +307,8 @@ class App:
         self.printer_badge.configure(foreground=c[self.printer_tone])
         if self.editor_text is not None:
             self.style_text(self.editor_text)
+        for tab in self.tabs.tabs():
+            self.tabs.nametowidget(tab).canvas.configure(background=c["panel"])
         self.draw_stage()
 
     def style_text(self, text):
@@ -325,16 +357,25 @@ class App:
         elif selected and self.library_tree.exists(selected[0]):
             self.library_tree.selection_set(selected[0])
 
-    def refresh_printers(self, scan=False):
+    def refresh_printers(self, scan=False, *, pair=None):
         if self.printer_busy:
             return
         previous = self.selected_port()
         nearby = scan and sys.platform == "linux"
         self.set_printer_busy(True)
-        self.show_printer_status("Finding printers…", "Looking for paired and nearby printers." if nearby else
-                                 "Looking for available printer connections.")
+        if pair:
+            self.show_printer_status("Pairing printer…", "Follow the Linux Bluetooth prompt if one appears.")
+        else:
+            self.show_printer_status("Finding printers…", "Looking for paired and nearby printers." if nearby else
+                                     "Looking for available printer connections.")
 
         def discover():
+            if pair:
+                try:
+                    pair_printer(pair)
+                except OSError as exc:
+                    self.status_events.put((None, str(exc)))
+                    return
             self.status_events.put(discover_printers(scan=nearby))
 
         threading.Thread(target=discover, daemon=True).start()
@@ -342,11 +383,15 @@ class App:
 
     def poll_discovery(self, previous):
         try:
-            self.ports, note = self.status_events.get_nowait()
+            ports, note = self.status_events.get_nowait()
         except queue.Empty:
             self.root.after(100, lambda: self.poll_discovery(previous))
             return
         self.set_printer_busy(False)
+        if ports is None:
+            self.show_printer_status("Pairing needs attention", note, "error")
+            return
+        self.ports = ports
         self.port_field.configure(values=tuple(candidate.display for candidate in self.ports.values()))
         recommended = suggested_port(self.ports)
         port = self.ports.get(previous.device, previous) if previous else recommended
@@ -404,6 +449,22 @@ class App:
         if port and active and active["port"] == port.device:
             return replace(port, protocol=MODELS.get(active["model"]) or port.protocol)
         return port
+
+    def printer_selected(self, _):
+        port = self.selected_port()
+        if port and port.issue:
+            self.loaded_roll = None
+            self.use_roll_button.state(["disabled"])
+            self.show_printer_status("Setup needed", f"{port.issue} See Setup help.")
+        else:
+            self.check_printer()
+
+    def open_printer_setup(self):
+        if self.printer_busy:
+            return
+        port = self.selected_port()
+        if PrinterSetupDialog(self.root, port).result:
+            self.refresh_printers(pair=port)
 
     def show_active_profile(self):
         name = self.settings.get("active_profile")
@@ -491,6 +552,11 @@ class App:
         self.checked_device = self.settings["port"]
         self.printer_model = model
         self.loaded_roll = status.roll if status else None
+        if status and (port := self.ports.get(self.checked_device)) and port.issue:
+            port = replace(port, issue="", pairable=False)
+            self.ports[port.device] = port
+            self.port_field.configure(values=tuple(candidate.display for candidate in self.ports.values()))
+            self.port.set(port.display)
         ready = status is not None and not status.issue
         if status:
             detail = (f"{status.issue or 'Ready'} · {status.description}"
@@ -511,7 +577,7 @@ class App:
         self.doc["media"] = roll.media
         self.set_label_size(length, roll.width, keep_center=True)
         self.rebuild_page()
-        self.tabs.select(self.page_panel)
+        self.tabs.select(self.inspector_tabs["page"])
         self.changed()
         self.footer.set(f"Set design to {length:g} × {roll.width:g} mm · {roll.media}")
 
@@ -591,7 +657,8 @@ class App:
             self.root.after_cancel(self.save_timer)
             self.save_timer = None
         try:
-            self.library.save(self.doc)
+            path = self.library.save(self.doc)
+            self.library_names[path] = (path.stat().st_mtime_ns, self.doc["title"])
             self.dirty = False
             if self.settings.get("last") != self.doc["id"]:
                 self.settings["last"] = self.doc["id"]
@@ -674,7 +741,7 @@ class App:
             try:
                 write_json(path, self.doc)
                 self.footer.set(f"Exported · {Path(path).name}")
-            except OSError as exc:
+            except (OSError, ValueError) as exc:
                 messagebox.showerror("Export project", str(exc), parent=self.root)
 
     def export_image(self):
@@ -886,7 +953,7 @@ class App:
     def edit_on_canvas(self, _):
         if self.editor_text is not None:
             self.drag = None
-            self.tabs.select(self.item_panel)
+            self.tabs.select(self.inspector_tabs["item"])
             self.editor_text.focus_set()
         return "break"
 
@@ -927,6 +994,9 @@ class App:
         self.select(list(self.layer_tree.selection()), sync_layers=False)
 
     def add_item(self, kind, **values):
+        if len(self.doc["elements"]) >= MAX_ELEMENTS:
+            self.footer.set(f"A label can have up to {MAX_ELEMENTS} elements.")
+            return
         w, _ = dimensions(self.doc)
         _, top, _, bottom = placement.printable_area(self.doc)
         height = min(bottom - top - 1, {"text": 4, "line": .25, "graphic": 7}.get(kind, 8))
@@ -942,7 +1012,7 @@ class App:
         item = element(kind, x=x, y=y, w=width, h=height, **values)
         self.doc["elements"].append(item)
         self.selected = [item["id"]]
-        self.tabs.select(self.item_panel)
+        self.tabs.select(self.inspector_tabs["item"])
         self.rebuild_elements()
         self.changed()
 
@@ -995,17 +1065,20 @@ class App:
             if prefix != "Stupid Print elements":
                 raise ValueError
             items = json.loads(payload)
-            if not isinstance(items, list):
+            if not isinstance(items, list) or len(items) > MAX_ELEMENTS:
                 raise ValueError
             used = set()
             for item in items:
                 validate_element(item, used)
-        except (tk.TclError, ValueError, TypeError, KeyError):
+        except (tk.TclError, ValueError, TypeError, KeyError, RecursionError, OverflowError):
             self.footer.set("Copy elements from a Stupid Print label before pasting.")
             return
         self.insert_copies(items)
 
     def insert_copies(self, sources):
+        if len(self.doc["elements"]) + len(sources) > MAX_ELEMENTS:
+            self.footer.set(f"A label can have up to {MAX_ELEMENTS} elements.")
+            return
         copies = [{**source, "id": uuid4().hex} for source in sources]
         if copies:
             page = dimensions(self.doc)
@@ -1251,7 +1324,11 @@ class App:
         def update(_):
             if text.edit_modified():
                 text.edit_modified(False)
-                item["value"] = text.get("1.0", "end-1c")
+                value = text.get("1.0", "end-1c")
+                if len(value) > MAX_LABEL_TEXT:
+                    text.delete(f"1.0+{MAX_LABEL_TEXT}c", "end-1c")
+                    self.footer.set(f"Label text is limited to {MAX_LABEL_TEXT:,} characters.")
+                item["value"] = value[:MAX_LABEL_TEXT]
                 self.layer_tree.set(item["id"], "layer", self.layer_title(item))
                 self.changed()
 

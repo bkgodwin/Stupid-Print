@@ -2,6 +2,7 @@
 .venv-tk/
 .runtime/
 .qa/
+dist/
 __pycache__/
 *.py[cod]
 *.stupidprint

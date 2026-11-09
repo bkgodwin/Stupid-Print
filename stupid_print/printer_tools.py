@@ -1,6 +1,7 @@
 """Dialogs for printer profiles, roll estimates, and the local job log."""
 
 import sqlite3
+import sys
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -10,6 +11,45 @@ from .widgets import button, field, tree_with_scroll
 
 MODELS = {"Auto detect": "", "Phomemo D30": "D30", "Phomemo D30N": "D30", "Nelko P21": "P21"}
 NEW_PROFILE = "New profile…"
+
+
+class PrinterSetupDialog(SettingsDialog):
+    def __init__(self, parent, port):
+        self.port = port
+        model = "Nelko P21" if port and port.hint == "P21" else "Printer"
+        super().__init__(parent, f"{model} setup")
+
+    def body(self, parent):
+        super().body(parent)
+        if self.port:
+            ttk.Label(parent, text=self.port.name or self.port.device, style="Section.TLabel").pack(anchor="w")
+        if sys.platform == "linux":
+            pairing = ("In Linux Bluetooth settings, pair the printer’s Bluetooth Classic entry. "
+                       "If Pair printer appears below, it starts pairing through the desktop’s Bluetooth prompt.")
+        else:
+            pairing = ("Add the printer in Windows Bluetooth settings, then select its outgoing COM port in Stupid Print. "
+                       "Find it under More Bluetooth settings → COM Ports.")
+        steps = (
+            "Turn the printer on and keep it nearby. Disconnect it from the phone app.",
+            pairing,
+            "Click Find printers and select the printer. Use Check status to confirm it is ready.",
+            "For the P21 starter roll, choose 40 × 14 mm under Label, or use Use loaded roll when available.",
+        )
+        for number, step in enumerate(steps, 1):
+            ttk.Label(parent, text=f"{number}. {step}", wraplength=395, justify="left").pack(
+                anchor="w", pady=(6, 0))
+
+    def buttonbox(self):
+        row = ttk.Frame(self, padding=(12, 6, 12, 10))
+        row.pack(fill="x")
+        close = button(row, "Close", self.cancel)
+        close.pack(side="right")
+        if self.port and self.port.pairable:
+            button(row, "Pair printer", self.ok, primary=True).pack(side="right", padx=6)
+        self.bind("<Escape>", self.cancel)
+
+    def apply(self):
+        self.result = True
 
 
 class ProfilesDialog(SettingsDialog):

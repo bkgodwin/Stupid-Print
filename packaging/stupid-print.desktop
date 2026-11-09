@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Stupid Print
+Comment=Design and print labels on Bluetooth thermal printers
+Exec=/opt/stupid-print/StupidPrint
+Icon=stupid-print
+Terminal=false
+Type=Application
+Categories=Graphics;Utility;

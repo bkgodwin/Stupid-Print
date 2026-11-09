@@ -2,7 +2,16 @@
 
 Stupid Print is a Python desktop label studio for the Phomemo D30 and Nelko P21. It designs and previews monochrome thermal labels and prints directly over Bluetooth Classic serial.
 
-## Start the app
+## Download Stupid Print 1.0
+
+Get the packages and SHA-256 checksums from the [GitHub release](https://github.com/bkgodwin/Stupid-Print/releases/tag/v1.0.0).
+
+- **Windows 10 or 11, x64.** Extract the portable ZIP and run **StupidPrint.exe**. Keep the executable and its `_internal` folder together. Projects and settings go in **Stupid Print Data** beside the executable. Remove the empty `portable.flag` file before launching if you want to use the existing AppData library. The executable is unsigned.
+- **Linux, x86-64.** Install the `.deb` with `sudo apt install ./stupid-print_1.0.0_amd64.deb`, then launch **Stupid Print** from the app menu. On other glibc-based distributions, extract the `.tar.gz` and run `./StupidPrint/StupidPrint`. The bundle targets glibc 2.35 or newer and needs an X11 or XWayland desktop. Bluetooth printing uses the system BlueZ service.
+
+Both packages include Python and the application dependencies.
+
+## Run from source
 
 | Platform | Launcher |
 | --- | --- |
@@ -26,6 +35,14 @@ Use **Profiles** to save a named printer or serial port, model and tape width. *
 
 Linux discovery requires the distribution’s BlueZ Bluetooth service. If the printer was paired using its Bluetooth Low Energy entry, pair its Bluetooth Classic entry if available. The app needs the printer’s Serial Port Profile. If the printer is already connected to a phone, close the phone app and retry.
 
+### Nelko P21 setup
+
+1. Power on the P21 and disconnect it from the Nelko phone app. On Linux, click **Find printers**, select **P21**, then open **Setup help**. **Pair printer** starts pairing through the desktop’s Bluetooth prompt when the printer is available for Classic pairing. You can also pair it in system Bluetooth settings.
+2. If Linux Bluetooth settings cannot complete pairing, try `bluetoothctl`, then run `power on`, `agent on`, and `scan on`. Run `pair AA:BB:CC:DD:EE:FF` with the P21’s address, then `info AA:BB:CC:DD:EE:FF` to check whether it is paired. Return to Stupid Print and click **Find printers**. On Windows, use the outgoing COM port for the paired printer. [BlueZ pairing commands](https://github.com/bluez/bluez/blob/master/doc/bluetoothctl.rst)
+3. Click **Check status**. If the printer is ready but the roll size is unavailable, select the size under **Label**. The included roll is **40 × 14 mm**, measured length × width.
+
+Stupid Print uses the P21’s Bluetooth Classic interface. If BlueZ cannot find the serial service for a paired P21, the app tries the channel used by the captured P21 protocol. A printer that only exposes Bluetooth Low Energy needs a different connection method. Desktop P21 support in Stupid Print is experimental. [P21 protocol capture](https://github.com/merlinschumacher/nelko-p21-print) · [Nelko P21 FAQ](https://nelko.com/pages/faq-nelko)
+
 The D30N protocol has been tested on Windows. The P21 implementation is based on captured serial traffic and still needs a physical test. Linux discovery and RFCOMM socket handoff have been tested with a simulated BlueZ service. Both drivers use RFCOMM serial.
 
 ## Design and save labels
@@ -46,6 +63,7 @@ The D30N protocol has been tested on Windows. The P21 implementation is based on
 - Open **Built-in templates** in the library to start from one of 12 editable designs. The cable flag and wrap repeat rotated text. The 24- and 48-port patch panels print as 162 mm sections of 12 consecutive ports at 13.5 mm pitch. Check your panel spacing before printing and use **Batch setup → MAC, host & ports** to set the starting port.
 - Edits autosave to the local library. **Save as template** keeps a reusable copy. Open any saved item to edit it, or choose **Use as copy** to start a new project from it.
 - The **Project files** menu contains template saving and export. Exporting a project creates a portable `.stupidprint` JSON document with embedded images and imported data. PNG export saves the current label at printer resolution. **Export batch PDF** lays out the entire batch as numbered, actual-size labels on US Letter or A4 proof sheets.
+- Projects support up to 256 elements and 64 MB per file. Source images can be up to 32 MB and 32 megapixels. PDF proofs support up to 5,000 labels.
 
 The library is stored in `%LOCALAPPDATA%\Stupid Print` on Windows and `$XDG_DATA_HOME/stupid-print` on Linux, with `~/.local/share/stupid-print` as the Linux default. Set `STUPID_PRINT_DATA_DIR` to use a different folder.
 
@@ -75,8 +93,12 @@ Insert fields into a text or barcode element with the inspector or type them dir
 
 **Label stock** saves a manual remaining count and low-stock threshold per printer, label dimensions and media type. Set the estimate when you load a roll. The print dialog warns when the count is low or below the selected job size. The count falls as the D30 confirms labels or the P21 returns ready after sending each label. Adjust the estimate after a jam or timeout based on the physical output. For continuous tape, enter an estimate in labels of the current design size.
 
+Data imports support up to 32 MB, 100,000 rows, 1,024 columns, and one million cells. Split larger data files into smaller batches.
+
 ## Development
 
 The GUI uses Tkinter. Pillow handles raster rendering, pySerial handles Bluetooth serial, and openpyxl reads Excel files. python-barcode encodes linear barcodes, ZXing-C++ encodes 2D barcodes, and ReportLab writes PDF proofs. Print history and stock estimates are stored in `print-jobs.sqlite3` in the library folder. Run the tests with `python -m unittest discover -s tests -v` in the project virtual environment.
 
 The D30 wire format is based on published protocol research in [polskafan/phomemo_d30](https://github.com/polskafan/phomemo_d30) and [Phomymo](https://github.com/transcriptionstream/phomymo). The P21 driver uses the protocol documented by [merlinschumacher/nelko-p21-print](https://github.com/merlinschumacher/nelko-p21-print).
+
+To rebuild the release, use x64 Python 3.14 on the target platform and install `packaging/requirements-build.txt` into a fresh virtual environment. Run `python packaging/build.py` to write archives to `dist`. Build Linux on Ubuntu 22.04 or an equivalent glibc 2.35 system with Xft-enabled Tk, `binutils`, and `dpkg-deb`.
