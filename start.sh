@@ -1,25 +1,66 @@
-#!/usr/bin/env bash
-set -euo pipefail
-cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+#!/bin/sh
+set -eu
+cd -- "$(dirname -- "$0")"
 
-if ! command -v python3 >/dev/null || ! python3 -c 'import sys, tkinter; sys.exit(sys.version_info < (3, 10))'; then
-    echo 'Stupid Print needs Python 3.10 or newer with Tcl/Tk.' >&2
-    echo 'On Debian/Ubuntu, run sudo apt install python3 python3-tk python3-venv' >&2
-    echo 'On Fedora, run sudo dnf install python3 python3-tkinter' >&2
-    exit 1
-fi
+tk_ready() {
+    "$@" -c 'import sys, tkinter; tkinter.Tcl(); sys.exit(sys.version_info < (3, 10))' >/dev/null 2>&1
+}
 
-if [[ ! -x .venv/bin/python ]]; then
-    if ! python3 -m venv .venv; then
-        echo 'Install your distribution’s Python venv package (python3-venv on Debian/Ubuntu) and try again.' >&2
-        exit 1
+system_python() {
+    local candidate
+    for candidate in python3 /usr/bin/python3; do
+        if tk_ready "$candidate" && "$candidate" -c 'import ensurepip' >/dev/null 2>&1; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+as_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    elif command -v sudo >/dev/null; then
+        sudo "$@"
+    else
+        return 1
     fi
+}
+
+install_tk() {
+    if command -v apt-get >/dev/null; then
+        as_root apt-get install python3 python3-tk python3-venv
+    elif command -v dnf >/dev/null; then
+        as_root dnf install python3 python3-tkinter
+    elif command -v pacman >/dev/null; then
+        as_root pacman -S --needed python tk
+    else
+        return 1
+    fi
+}
+
+venv=.venv
+rebuilt=0
+if [ -d "$venv" ] && ! tk_ready "$venv/bin/python"; then
+    venv=.venv-tk
 fi
-if ! .venv/bin/python -m pip --version >/dev/null 2>&1; then
-    .venv/bin/python -m ensurepip --upgrade
+if ! tk_ready "$venv/bin/python"; then
+    if ! python=$(system_python); then
+        echo 'Installing Python, Tcl/Tk and venv support through your Linux package manager.'
+        if ! install_tk || ! python=$(system_python); then
+            echo 'Stupid Print needs Python 3.10 or later with Tcl/Tk and venv. Install these through your distribution and rerun the launcher.' >&2
+            exit 1
+        fi
+    fi
+    "$python" -m venv "$venv"
+    rebuilt=1
 fi
-if ! cmp -s requirements.txt .venv/stupid-print-requirements.txt; then
-    .venv/bin/python -m pip install --disable-pip-version-check -r requirements.txt
-    cp -- requirements.txt .venv/stupid-print-requirements.txt
+python="$venv/bin/python"
+if ! "$python" -m pip --version >/dev/null 2>&1; then
+    "$python" -m ensurepip --upgrade
 fi
-exec .venv/bin/python -m stupid_print
+if [ "$rebuilt" -eq 1 ] || ! cmp -s requirements.txt "$venv/stupid-print-requirements.txt"; then
+    "$python" -m pip install --disable-pip-version-check -r requirements.txt
+    cp -- requirements.txt "$venv/stupid-print-requirements.txt"
+fi
+exec "$python" -m stupid_print

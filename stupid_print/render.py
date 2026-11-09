@@ -10,13 +10,15 @@ from functools import lru_cache
 from pathlib import Path
 
 import barcode
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 from .model import dimensions
 
 
+DPI = 203
 DOTS_PER_MM = 8
 HEAD_DOTS = 96
+TEXT_SCALE = 3
 EMOJIS = ("★", "✓", "⚠", "♥", "☎", "✉", "⚡", "♻", "🏷️", "🔧", "📦", "🔌", "😀", "🚀")
 BARCODES = {"Code 128": "code128", "Code 39": "code39", "EAN-13": "ean13", "UPC-A": "upca"}
 
@@ -164,12 +166,17 @@ def _lines(text, font, size, stroke, limit):
 
 
 def _text_image(item, value, size):
-    width, height = size
+    width, height = (side * TEXT_SCALE for side in size)
     points = float(item["size"])
     if not 3 <= points <= 96:
         raise ValueError("Text size must be between 3 and 96 pt.")
-    start = max(1, round(points * DOTS_PER_MM * 25.4 / 72))
-    for pixels in range(start, max(5, min(start, 6)) - 1, -1):
+    start = round(points * DPI * TEXT_SCALE / 72)
+    if item["fit"]:
+        start = min(start, max(6 * TEXT_SCALE, height))
+    minimum = min(start, 6 * TEXT_SCALE)
+    # Include the minimum even when the initial size falls between native dots.
+    candidates = [*range(start, minimum, -TEXT_SCALE), minimum]
+    for pixels in candidates:
         font, fake_bold, fake_italic = _font(item["font"], pixels, item["bold"], item["italic"])
         stroke = max(1, pixels // 22) if fake_bold else 0
         ascent, descent = font.getmetrics()
@@ -182,9 +189,10 @@ def _text_image(item, value, size):
             break
     total_height = leading * len(lines)
     top = {"Top": 0, "Middle": (height - total_height) // 2, "Bottom": height - total_height}[item["valign"]]
-    result = Image.new("L", size, 255)
+    result = Image.new("L", (width, height), 255)
     for line, line_width in zip(lines, widths):
-        line_image = Image.new("L", (max(1, min(width + 2, line_width + shear + 2)), leading), 255)
+        padding = 2 * TEXT_SCALE
+        line_image = Image.new("L", (max(1, min(width + padding, line_width + shear + padding)), leading), 255)
         draw = ImageDraw.Draw(line_image)
         x = 0
         for run in line:
@@ -197,15 +205,19 @@ def _text_image(item, value, size):
             x += _run_width(run, font, pixels, stroke)
         if item["underline"] and x:
             y = min(leading - 1, ascent + max(1, pixels // 14))
-            draw.line((0, y, x - 1, y), fill=0, width=max(1, pixels // 13))
+            draw.line((0, y, x - 1, y), fill=0, width=max(TEXT_SCALE, pixels // 13))
         if fake_italic:
             line_image = line_image.transform(line_image.size, Image.Transform.AFFINE,
-                                              (1, 0.2, -shear, 0, 1, 0), fillcolor=255)
+                                              (1, 0.2, -shear, 0, 1, 0),
+                                              resample=Image.Resampling.BICUBIC, fillcolor=255)
         left = {"Left": 0, "Center": (width - line_width - shear) // 2,
                 "Right": width - line_width - shear}[item["align"]]
         result.paste(line_image, (left, top))
         top += leading
-    return result
+    # Convert high-resolution coverage to native dots without the old dark cutoff
+    # thickening every partially covered edge. Preserve light strokes in tiny type.
+    threshold = 165 if pixels <= 16 * TEXT_SCALE else 145
+    return result.resize(size, Image.Resampling.LANCZOS).point(lambda p: 0 if p < threshold else 255)
 
 
 def _barcode_image(item, value, size):
@@ -263,6 +275,23 @@ def _read_image(encoded):
         return source.convert("RGBA")
 
 
+def _picture(item, size):
+    source = ImageOps.contain(_read_image(item["image"]), size, Image.Resampling.LANCZOS)
+    # Work on the artwork before adding the empty margins of the image box.
+    gray = Image.new("L", source.size, 255)
+    gray.paste(source.convert("L"), (0, 0), source.getchannel("A"))
+    gray = ImageOps.autocontrast(gray, cutoff=1, preserve_tone=True)
+    gray = gray.filter(ImageFilter.UnsharpMask(radius=0.8, percent=85, threshold=3))
+    gray = gray.point(lambda pixel: 255 if pixel >= 245 else (0 if pixel <= 12 else pixel))
+    if item["dither"]:
+        gray = gray.convert("1", dither=Image.Dither.FLOYDSTEINBERG).convert("L")
+    else:
+        gray = gray.point(lambda pixel: 0 if pixel < 155 else 255)
+    layer = Image.new("L", size, 255)
+    layer.paste(gray, ((size[0] - gray.width) // 2, (size[1] - gray.height) // 2))
+    return layer
+
+
 def render_label(doc, batch, index):
     width, height = map(dots, dimensions(doc))
     result = Image.new("L", (width, height), 255)
@@ -293,15 +322,13 @@ def render_label(doc, batch, index):
             layer = _text_image(item, value, size)
         elif kind == "barcode":
             layer = _barcode_image(item, batch.expand(item["value"], context), size)
+            # White spaces and quiet zones are part of a scannable symbol.
+            result.paste(layer, (x, y))
+            continue
         elif kind == "line":
             layer = Image.new("L", size, 0)
         elif item["image"]:
-            source = ImageOps.contain(_read_image(item["image"]), size, Image.Resampling.LANCZOS)
-            layer = Image.new("L", size, 255)
-            layer.paste(source.convert("L"), ((size[0] - source.width) // 2, (size[1] - source.height) // 2),
-                        source.getchannel("A"))
-            if item["dither"]:
-                layer = layer.convert("1").convert("L")
+            layer = _picture(item, size)
         else:
             continue
         # Composite black ink only. An element's white background leaves the design below visible.
@@ -310,7 +337,7 @@ def render_label(doc, batch, index):
         margin = (height - HEAD_DOTS) // 2
         result.paste(255, (0, 0, width, margin))
         result.paste(255, (0, margin + HEAD_DOTS, width, height))
-    return result.point(lambda pixel: 0 if pixel < 185 else 255, mode="1")
+    return result.convert("1", dither=Image.Dither.NONE)
 
 
 def raster_packet(image, continuous=False):

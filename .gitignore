@@ -1,4 +1,6 @@
 .venv/
+.venv-tk/
+.runtime/
 .qa/
 __pycache__/
 *.py[cod]
