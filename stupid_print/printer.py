@@ -31,6 +31,7 @@ P21_ISSUES = {
 class PrinterPort:
     device: str
     name: str = ""
+    protocol: str = ""
 
     @property
     def display(self):
@@ -38,6 +39,8 @@ class PrinterPort:
 
     @property
     def hint(self):
+        if self.protocol:
+            return self.protocol
         if re.search(r"(?<![A-Z0-9])D30[A-Z]?(?![A-Z0-9])", self.name, re.IGNORECASE):
             return "D30"
         if re.search(r"(?<![A-Z0-9])P21(?![A-Z0-9])", self.name, re.IGNORECASE):
@@ -170,7 +173,7 @@ class SerialPrinter:
 
     def validate_stock(self, doc, status):
         roll = status.roll
-        if roll and (dimensions(doc) != (roll.length, roll.width) or doc["media"] != roll.media):
+        if roll and not roll.matches(doc):
             raise ValueError(f"The {self.model} reports {roll.description}. Match the design to the loaded roll.")
 
 
@@ -212,6 +215,11 @@ class LabelRoll:
     width: int
     media: str
     gap: int
+
+    def matches(self, doc):
+        length, width = dimensions(doc)
+        return (width == self.width and doc["media"] == self.media
+                and (self.media == "Continuous tape" or length == self.length))
 
     @property
     def description(self):

@@ -7,7 +7,7 @@ import os
 import re
 import tempfile
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -16,6 +16,20 @@ from .artwork import GRAPHICS
 
 EXTENSION = ".stupidprint"
 TOKEN = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
+DATE_OFFSET = re.compile(r"date([+-]\d+)d")
+DATE_FORMATS = {"YYYY-MM-DD": "%Y-%m-%d", "MM/DD/YYYY": "%m/%d/%Y",
+                "DD/MM/YYYY": "%d/%m/%Y", "DD MMM YYYY": "%d %b %Y"}
+MAC_FORMATS = ("Colon", "Hyphen", "Dot")
+MATRIX_CODES = ("QR Code", "Data Matrix")
+QR_LEVELS = ("L", "M", "Q", "H")
+BATCH_DEFAULTS = {
+    "count": "1", "serial_start": "1", "serial_step": "1", "serial_pad": "0",
+    "ip_start": "192.168.1.1", "ip_mask": "255.255.255.0", "ip_step": "1",
+    "mac_oui": "02:00:00", "mac_start": "000001", "mac_step": "1", "mac_format": "Colon",
+    "hostname_prefix": "host-", "port_start": "1", "port_step": "1",
+    "date_format": "YYYY-MM-DD", "expiry_days": "30",
+}
+PORT_FIELD = re.compile(r"port(?:\+(\d+))?")
 PRESETS = {"40 × 12 mm": (40, 12), "40 × 14 mm": (40, 14), "30 × 12 mm": (30, 12), "22 × 12 mm": (22, 12),
            "12 × 12 mm": (12, 12), "30 × 14 mm": (30, 14), "40 × 15 mm": (40, 15)}
 
@@ -24,9 +38,11 @@ def element(kind, **values):
     item = {"id": uuid4().hex, "kind": kind, "x": 2, "y": 2, "w": 36, "h": 8}
     if kind == "text":
         item.update(value="Your label", font="Default", size=12, align="Center",
-                    valign="Middle", bold=False, italic=False, underline=False, fit=True)
+                    valign="Middle", bold=False, italic=False, underline=False, fit=True, rotation="0°")
     elif kind == "barcode":
         item.update(value="12345", symbology="Code 128", caption=True, compact=False)
+    elif kind == "matrix":
+        item.update(value="ASSET-001", symbology="QR Code", correction="M")
     elif kind == "image":
         item.update(image="", filename="", dither=True)
     elif kind == "graphic":
@@ -40,8 +56,7 @@ def new_document(title="Untitled label", kind="project"):
         "version": 1, "id": uuid4().hex, "title": title, "kind": kind,
         "width": 40, "height": 12, "media": "Gap labels", "border": "None", "border_width": 1,
         "elements": [element("text")],
-        "batch": {"count": "1", "serial_start": "1", "serial_step": "1", "serial_pad": "0",
-                  "ip_start": "192.168.1.1", "ip_mask": "255.255.255.0", "ip_step": "1"},
+        "batch": BATCH_DEFAULTS.copy(),
         "data": {"name": "", "headers": [], "rows": []},
     }
 
@@ -93,11 +108,11 @@ def read_document(path):
         if not isinstance(doc["elements"], list):
             raise ValueError("Invalid label elements.")
         for item in doc["elements"]:
-            _validate_element(item, used)
-        batch = doc["batch"]
-        for key in ("count", "serial_start", "serial_step", "serial_pad", "ip_start", "ip_mask", "ip_step"):
-            if not isinstance(batch[key], str):
-                raise ValueError("Invalid batch settings.")
+            validate_element(item, used)
+        batch = {**BATCH_DEFAULTS, **doc["batch"]}
+        if any(not isinstance(batch[key], str) for key in BATCH_DEFAULTS):
+            raise ValueError("Invalid batch settings.")
+        doc["batch"] = batch
         data = doc["data"]
         headers, rows = data["headers"], data["rows"]
         if not isinstance(data["name"], str) or not isinstance(headers, list) or not isinstance(rows, list):
@@ -112,7 +127,7 @@ def read_document(path):
     return doc
 
 
-def _validate_element(item, used):
+def validate_element(item, used):
     uid = item["id"]
     if not isinstance(uid, str) or not uid or uid in used:
         raise ValueError("Invalid element identifier.")
@@ -122,12 +137,14 @@ def _validate_element(item, used):
         if not low <= item[key] <= high:
             raise ValueError("Invalid element dimensions.")
     kind = item["kind"]
-    if kind in ("text", "barcode") and not isinstance(item["value"], str):
+    if kind in ("text", "barcode", "matrix") and not isinstance(item["value"], str):
         raise ValueError("Invalid element text.")
     if kind == "text":
+        item.setdefault("rotation", "0°")
         if (not isinstance(item["font"], str) or not 3 <= float(item["size"]) <= 96
                 or item["align"] not in ("Left", "Center", "Right")
                 or item["valign"] not in ("Top", "Middle", "Bottom")
+                or item["rotation"] not in ("0°", "90°", "180°", "270°")
                 or any(not isinstance(item[key], bool) for key in ("bold", "italic", "underline", "fit"))):
             raise ValueError("Invalid text format.")
     elif kind == "barcode":
@@ -135,6 +152,9 @@ def _validate_element(item, used):
         if (item["symbology"] not in ("Code 128", "Code 39", "EAN-13", "UPC-A")
                 or any(not isinstance(item[key], bool) for key in ("caption", "compact"))):
             raise ValueError("Invalid barcode format.")
+    elif kind == "matrix":
+        if item["symbology"] not in MATRIX_CODES or item["correction"] not in QR_LEVELS:
+            raise ValueError("Invalid 2D code format.")
     elif kind == "image":
         if not all(isinstance(item[key], str) for key in ("image", "filename")) or not isinstance(item["dither"], bool):
             raise ValueError("Invalid image format.")
@@ -265,10 +285,10 @@ def _integer(values, field, label):
 class Batch:
     """Compute any row on demand, including batches larger than the visible list."""
 
-    def __init__(self, doc):
+    def __init__(self, doc, *, today=None):
         self.doc = doc
         self.data = doc["data"]
-        self.settings = doc["batch"]
+        self.settings = {**BATCH_DEFAULTS, **doc["batch"]}
         self.count = _integer(self.settings, "count", "Label count")
         row_count = len(self.data["rows"])
         if self.count == 0 and row_count:
@@ -278,13 +298,45 @@ class Batch:
                              "With imported data, count cannot exceed the number of rows.")
         self.tokens = {token.strip().lower() for item in doc["elements"]
                        for token in TOKEN.findall(item.get("value", ""))}
-        self.today = date.today().isoformat()
-        if "serial" in self.tokens:
+        self.today = today or date.today()
+        self.date_values = self._date_values()
+        if self.tokens & {"serial", "hostname"}:
             self.serial_start = _integer(self.settings, "serial_start", "Serial start")
             self.serial_step = _integer(self.settings, "serial_step", "Serial increment")
             self.serial_pad = _integer(self.settings, "serial_pad", "Serial padding")
             if not 0 <= self.serial_pad <= 32:
                 raise ValueError("Serial padding must be between 0 and 32.")
+        if "hostname" in self.tokens:
+            self.hostname_prefix = self.settings["hostname_prefix"]
+            for serial in (self.serial_start, self.serial_start + (self.count - 1) * self.serial_step):
+                name = self.hostname_prefix + str(serial).zfill(self.serial_pad)
+                if not re.fullmatch(r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?", name):
+                    raise ValueError("Hostnames must be 1–63 letters, digits or hyphens and start and end with a letter or digit.")
+                if serial < 0:
+                    raise ValueError("Hostname serials must be zero or greater.")
+        if "mac" in self.tokens:
+            oui = self.settings["mac_oui"].strip()
+            suffix = self.settings["mac_start"].strip()
+            if not re.fullmatch(r"[0-9a-fA-F]{6}|[0-9a-fA-F]{2}([:-])[0-9a-fA-F]{2}\1[0-9a-fA-F]{2}", oui):
+                raise ValueError("Enter a 6-digit hexadecimal OUI, for example 02:00:00.")
+            if not re.fullmatch(r"[0-9a-fA-F]{1,6}", suffix):
+                raise ValueError("Enter a hexadecimal MAC suffix from 0 through FFFFFF.")
+            self.mac_oui = oui.replace(":", "").replace("-", "").upper()
+            self.mac_start = int(suffix, 16)
+            self.mac_step = _integer(self.settings, "mac_step", "MAC increment")
+            self.mac_format = self.settings["mac_format"]
+            if self.mac_format not in MAC_FORMATS:
+                raise ValueError("Choose colon, hyphen or dot MAC formatting.")
+            if not 0 <= self.mac_start + (self.count - 1) * self.mac_step <= 0xffffff:
+                raise ValueError("The last MAC suffix would fall outside the OUI.")
+        self.port_fields = {token: int(match[1] or 0) for token in self.tokens
+                            if (match := PORT_FIELD.fullmatch(token))}
+        if self.port_fields:
+            self.port_start = _integer(self.settings, "port_start", "Starting port")
+            self.port_step = _integer(self.settings, "port_step", "Port increment per label")
+            end = self.port_start + (self.count - 1) * self.port_step
+            if min(self.port_start, end) < 1 or max(self.port_start, end) + max(self.port_fields.values()) > 9999:
+                raise ValueError("Port numbers must stay between 1 and 9999 across the batch.")
         if self.tokens & {"ip", "subnet", "prefix", "cidr"}:
             try:
                 self.address = ipaddress.ip_address(self.settings["ip_start"].strip())
@@ -297,14 +349,39 @@ class Batch:
             if not int(self.network.network_address) <= last <= int(self.network.broadcast_address):
                 raise ValueError(f"The last IP would fall outside {self.network}.")
 
+    def _date_values(self):
+        format_code = DATE_FORMATS.get(self.settings["date_format"])
+        if not format_code:
+            raise ValueError("Choose a date format in Batch setup.")
+        values = {"date": self.today.strftime(format_code)}
+        for token in self.tokens:
+            match = DATE_OFFSET.fullmatch(token)
+            if token == "expiry" or match:
+                offset = _integer(self.settings, "expiry_days", "Expiry offset") if token == "expiry" else int(match[1])
+                try:
+                    values[token] = (self.today + timedelta(days=offset)).strftime(format_code)
+                except OverflowError as exc:
+                    raise ValueError("The date offset falls outside the supported calendar.") from exc
+        return values
+
     def context(self, index):
         if not 0 <= index < self.count:
             raise IndexError("Label is outside the batch.")
         fields = (dict(zip(self.data["headers"], self.data["rows"][index]))
                   if self.data["rows"] else {})
-        values = {"index": str(index + 1), "date": self.today}
-        if "serial" in self.tokens:
-            values["serial"] = str(self.serial_start + index * self.serial_step).zfill(self.serial_pad)
+        values = {"index": str(index + 1), **self.date_values}
+        if self.tokens & {"serial", "hostname"}:
+            serial = str(self.serial_start + index * self.serial_step).zfill(self.serial_pad)
+            values["serial"] = serial
+            if "hostname" in self.tokens:
+                values["hostname"] = self.hostname_prefix + serial
+        if "mac" in self.tokens:
+            address = self.mac_oui + f"{self.mac_start + index * self.mac_step:06X}"
+            separator, group = {"Colon": (":", 2), "Hyphen": ("-", 2), "Dot": (".", 4)}[self.mac_format]
+            values["mac"] = separator.join(address[i:i + group] for i in range(0, 12, group))
+        if self.port_fields:
+            port = self.port_start + index * self.port_step
+            values.update((token, str(port + offset)) for token, offset in self.port_fields.items())
         if self.tokens & {"ip", "subnet", "prefix", "cidr"}:
             address = self.address + index * self.ip_step
             prefix = str(self.network.prefixlen)

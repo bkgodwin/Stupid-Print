@@ -1,22 +1,29 @@
 """Tk desktop editor for Stupid Print."""
 
 import copy
+import json
 import queue
+import sqlite3
 import threading
 import tkinter as tk
+from datetime import date
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from uuid import uuid4
 
 from PIL import Image, ImageTk
 
-from .artwork import EMOJI_GRAPHICS, GRAPHICS
-from .dialogs import BatchSetup, ChoiceDialog, FontPicker, GraphicPicker, PrintDialog
-from .model import (EXTENSION, PRESETS, Batch, Library, dimensions, element, excel_sheets,
-                    import_data, new_document, read_document, write_json)
+from .artwork import EMOJI_GRAPHICS, GHS_ARTWORK, GRAPHICS
+from .dialogs import BatchSetup, ChoiceDialog, FontPicker, GraphicPicker, PrintDialog, ProofDialog
+from .jobs import JobStore
+from .model import (EXTENSION, MATRIX_CODES, PRESETS, QR_LEVELS, Batch, Library, dimensions, element,
+                    excel_sheets, import_data, new_document, read_document, validate_element, write_json)
 from . import placement
 from .printer import PrinterPort, available_ports, connect_printer, suggested_port
+from .printer_tools import MODELS, JobHistoryDialog, ProfilesDialog, StockDialog
+from .proof import PAPER_SIZES
 from .render import BARCODES, DPI, embed_image, render_label
+from .templates import bundled_templates
 from .widgets import BatchList, button, configure_style, field, tree_with_scroll
 
 
@@ -25,6 +32,7 @@ class App:
         self.root = root
         self.library = library or Library()
         self.settings = self.library.settings()
+        self.jobs = JobStore(self.library.path)
         self.doc = new_document()
         self.dirty = False
         self.save_timer = None
@@ -46,6 +54,7 @@ class App:
         self.port = tk.StringVar(value=self.settings.get("port", ""))
         self.printer_title = tk.StringVar(value="Printer status")
         self.printer_detail = tk.StringVar(value="Choose a Bluetooth serial port.")
+        self.profile_note = tk.StringVar()
         self.heading = tk.StringVar()
         self.subtitle = tk.StringVar()
         self.preview_note = tk.StringVar()
@@ -59,6 +68,9 @@ class App:
         self.align_reference = tk.StringVar(value="Selection")
         self.library_paths = {}
         self.library_names = {}
+        self.builtins = bundled_templates()
+        self.history = []
+        self.history_index = 0
         self.dark = self.settings.get("theme") != "light"
         self.colors = configure_style(root, self.dark)
         root.title("Stupid Print — Label Studio")
@@ -69,6 +81,10 @@ class App:
         root.bind("<Control-n>", lambda _: self.new_project())
         root.bind("<Control-o>", lambda _: self.open_file())
         root.bind("<Control-p>", lambda _: self.open_print())
+        for sequence, command in (("<Control-z>", self.undo), ("<Control-y>", self.redo),
+                                  ("<Control-Shift-Z>", self.redo), ("<Control-c>", self.copy_items),
+                                  ("<Control-v>", self.paste_items)):
+            root.bind(sequence, lambda event, action=command: self.editor_shortcut(event, action))
         self.build()
         self.apply_theme()
         self.update_library()
@@ -97,9 +113,18 @@ class App:
         ttk.Label(wordmark, text="Stupid Print", style="Header.TLabel").pack(anchor="w")
         ttk.Label(wordmark, text="D E S K T O P   L A B E L   S T U D I O", style="HeaderSub.TLabel").pack(anchor="w")
         button(header, "Print batch…", self.open_print, primary=True).pack(side="right")
+        button(header, "Print history…", self.open_history).pack(side="right", padx=(0, 8))
         button(header, "Save", self.save).pack(side="right", padx=8)
         button(header, "New label", self.new_project).pack(side="right")
         ttk.Button(header, textvariable=self.theme_label, command=self.toggle_theme).pack(side="right", padx=8)
+        edit = ttk.Menubutton(header, text="Edit", width=0)
+        self.edit_menu = tk.Menu(edit, tearoff=False, postcommand=self.update_edit_menu)
+        for label, shortcut, action in (("Undo", "Ctrl+Z", self.undo), ("Redo", "Ctrl+Y", self.redo),
+                                        ("Copy elements", "Ctrl+C", self.copy_items),
+                                        ("Paste elements", "Ctrl+V", self.paste_items)):
+            self.edit_menu.add_command(label=label, accelerator=shortcut, command=action)
+        edit.configure(menu=self.edit_menu)
+        edit.pack(side="right")
 
         main = ttk.Frame(self.root, style="App.TFrame", padding=(13, 13, 13, 0))
         main.pack(fill="both", expand=True)
@@ -118,11 +143,12 @@ class App:
 
     def build_library(self, parent):
         ttk.Label(parent, text="Library", style="Section.TLabel").pack(anchor="w")
-        ttk.Label(parent, text="Saved projects and templates", style="Muted.TLabel").pack(anchor="w", pady=(2, 8))
-        frame, self.library_tree = tree_with_scroll(parent, ("name", "kind"), height=9, selectmode="browse")
+        ttk.Label(parent, text="Projects and starter designs", style="Muted.TLabel").pack(anchor="w", pady=(2, 8))
+        frame, self.library_tree = tree_with_scroll(parent, ("kind",), height=9, selectmode="browse")
         frame.pack(fill="both", expand=True)
-        self.library_tree.heading("name", text="Name")
-        self.library_tree.column("name", width=145, minwidth=100)
+        self.library_tree.configure(show="tree headings")
+        self.library_tree.heading("#0", text="Name")
+        self.library_tree.column("#0", width=158, minwidth=115)
         self.library_tree.heading("kind", text="Type")
         self.library_tree.column("kind", width=70, minwidth=60, stretch=False)
         self.library_tree.bind("<Double-Button-1>", lambda _: self.open_saved())
@@ -137,7 +163,8 @@ class App:
                                       accelerator="Ctrl+O")
         for label, command in (("Save as template…", self.save_template),
                                ("Export project file…", self.export_project),
-                               ("Export current label PNG…", self.export_image)):
+                               ("Export current label PNG…", self.export_image),
+                               ("Export batch PDF…", self.export_pdf)):
             self.project_menu.add_command(label=label, command=command)
         project.configure(menu=self.project_menu)
         project.pack(fill="x", pady=(0, 3))
@@ -157,6 +184,13 @@ class App:
         self.use_roll_button = button(parent, "Use loaded roll", self.use_loaded_roll)
         self.use_roll_button.state(["disabled"])
         self.use_roll_button.pack(fill="x", pady=(5, 0))
+        actions = ttk.Frame(parent)
+        actions.pack(fill="x", pady=(5, 0))
+        button(actions, "Profiles…", self.open_profiles).pack(side="left")
+        button(actions, "Label stock…", self.open_stock).pack(side="left", padx=5)
+        ttk.Label(parent, textvariable=self.profile_note, wraplength=205, style="Muted.TLabel").pack(
+            anchor="w", pady=(3, 0))
+        self.port.trace_add("write", lambda *_: self.show_active_profile())
 
     def build_stage(self, parent):
         ttk.Label(parent, textvariable=self.heading, style="Title.TLabel").pack(anchor="w")
@@ -165,10 +199,9 @@ class App:
         toolbar.pack(fill="x", pady=(0, 8))
         for name, action in (("+ Text", lambda: self.add_item("text")),
                              ("+ Barcode", lambda: self.add_item("barcode")),
+                             ("+ 2D code", self.add_matrix),
                              ("+ Image", self.add_image), ("+ Graphic", self.add_graphic)):
-            button(toolbar, name, action).pack(side="left", padx=(0, 4))
-        ttk.Checkbutton(toolbar, text="Print dots", variable=self.print_dots,
-                        command=self.preview_mode_changed).pack(side="right")
+            button(toolbar, name, action, width=0).pack(side="left", padx=(0, 4))
         self.canvas = tk.Canvas(parent, highlightthickness=0, height=188, takefocus=True)
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", lambda _: self.draw_stage())
@@ -179,8 +212,13 @@ class App:
         self.canvas.bind("<KeyPress>", self.canvas_key)
         self.canvas.bind("<Control-a>", lambda _: self.select_all())
         self.canvas.bind("<Control-d>", lambda _: self.duplicate_item() or "break")
-        ttk.Label(parent, textvariable=self.preview_note, style="Muted.TLabel", wraplength=530).pack(
-            anchor="w", pady=(5, 8))
+        preview_info = ttk.Frame(parent)
+        preview_info.pack(fill="x", pady=(5, 8))
+        ttk.Checkbutton(preview_info, text="Print dots", variable=self.print_dots,
+                        command=self.preview_mode_changed).pack(side="right", padx=(8, 0))
+        note = ttk.Label(preview_info, textvariable=self.preview_note, style="Muted.TLabel")
+        note.pack(side="left", fill="x", expand=True)
+        preview_info.bind("<Configure>", lambda event: note.configure(wraplength=max(180, event.width - 90)))
         ttk.Separator(parent).pack(fill="x", pady=(0, 8))
         row = ttk.Frame(parent)
         row.pack(fill="x", pady=(0, 5))
@@ -231,8 +269,9 @@ class App:
         self.theme_label.set("Light mode" if self.dark else "Dark mode")
         self.brand.configure(background=c["header"])
         self.canvas.configure(background=c["stage"])
-        self.project_menu.configure(background=c["panel"], foreground=c["ink"],
-                                    activebackground=c["selected"], activeforeground=c["ink"])
+        for menu in (self.project_menu, self.edit_menu):
+            menu.configure(background=c["panel"], foreground=c["ink"],
+                           activebackground=c["selected"], activeforeground=c["ink"])
         self.printer_badge.configure(foreground=c[self.printer_tone])
         if self.editor_text is not None:
             self.style_text(self.editor_text)
@@ -255,6 +294,8 @@ class App:
 
     def update_library(self):
         selected = self.library_tree.selection()
+        builtin_group = "builtins"
+        expanded = not self.library_tree.exists(builtin_group) or self.library_tree.item(builtin_group, "open")
         self.library_tree.delete(*self.library_tree.get_children())
         self.library_paths.clear()
         names = {}
@@ -270,12 +311,16 @@ class App:
             except (OSError, ValueError, TypeError, KeyError):
                 name = "Unreadable document"
             self.library_paths[key] = path
-            self.library_tree.insert("", "end", iid=key, values=(name, path.parent.name.title()))
+            self.library_tree.insert("", "end", iid=key, text=name, values=(path.parent.name.title(),))
+        self.library_tree.insert("", "end", iid=builtin_group, text="Built-in templates", values=(str(len(self.builtins)),),
+                                 open=expanded)
+        for uid, doc in self.builtins.items():
+            self.library_tree.insert(builtin_group, "end", iid=uid, text=doc["title"], values=("Starter",))
         self.library_names = names
         key = self.doc["kind"] + "/" + self.doc["id"]
         if key in self.library_paths:
             self.library_tree.selection_set(key)
-        elif selected and selected[0] in self.library_paths:
+        elif selected and self.library_tree.exists(selected[0]):
             self.library_tree.selection_set(selected[0])
 
     def find_ports(self):
@@ -303,8 +348,63 @@ class App:
         choice = self.port.get().strip()
         if not choice:
             return None
-        return next((port for port in self.ports.values() if choice in (port.display, port.device)),
+        port = next((port for port in self.ports.values() if choice in (port.display, port.device)),
                     PrinterPort(choice))
+        active = self.settings.get("profiles", {}).get(self.settings.get("active_profile"))
+        if active and active["port"] == port.device:
+            return PrinterPort(port.device, port.name, MODELS.get(active["model"], ""))
+        return port
+
+    def show_active_profile(self):
+        name = self.settings.get("active_profile")
+        active = self.settings.get("profiles", {}).get(name)
+        port = self.selected_port()
+        self.profile_note.set(f"{name} · {active['width']:g} mm" if active and port and
+                              active["port"] == port.device else "")
+
+    def open_profiles(self):
+        if self.printer_busy:
+            self.footer.set("Wait for the current printer check or job to finish.")
+            return
+        port = self.selected_port()
+        result = ProfilesDialog(self, port.device if port else "", self.doc["height"]).result
+        if result is None:
+            return
+        previous, name, profile = result
+        profiles = self.settings.setdefault("profiles", {})
+        was_active = previous == self.settings.get("active_profile")
+        profiles.pop(previous, None)
+        if profile:
+            profiles[name] = profile
+            self.settings["active_profile"] = name
+            device = profile["port"]
+            self.port.set(self.ports.get(device, PrinterPort(device)).display)
+            self.set_label_size(self.doc["width"], profile["width"], keep_center=True)
+            self.rebuild_page()
+        elif was_active or previous is None:
+            self.settings.pop("active_profile", None)
+        self.persist_settings()
+        self.show_active_profile()
+        if profile or was_active:
+            self.check_printer()
+
+    def open_stock(self):
+        port = self.selected_port()
+        if not port:
+            messagebox.showinfo("Label stock", "Choose a printer port to track stock for it.", parent=self.root)
+            return
+        try:
+            stock = self.jobs.stock(port.device, self.doc)
+            length, width = dimensions(self.doc)
+            size = f"{length:g} × {width:g} mm · {self.doc['media']}"
+            result = StockDialog(self.root, port.device, size, stock).result
+            if result is not None:
+                self.jobs.set_stock(port.device, self.doc, *result)
+                remaining = result[0]
+                self.footer.set(f"Stock estimate saved · {remaining:,} left" if remaining is not None else
+                                "Stock tracking cleared for this size and media.")
+        except (OSError, sqlite3.Error) as exc:
+            messagebox.showerror("Label stock", str(exc), parent=self.root)
 
     def check_printer(self):
         if self.printer_busy:
@@ -366,12 +466,13 @@ class App:
         if not port or port.device != self.checked_device or not roll:
             self.check_printer()
             return
-        self.set_label_size(roll.length, roll.width, keep_center=True)
+        length = self.doc["width"] if roll.media == "Continuous tape" else roll.length
         self.doc["media"] = roll.media
+        self.set_label_size(length, roll.width, keep_center=True)
         self.rebuild_page()
         self.tabs.select(self.page_panel)
         self.changed()
-        self.footer.set(f"Set design to {roll.description}")
+        self.footer.set(f"Set design to {length:g} × {roll.width:g} mm · {roll.media}")
 
     def preview_mode_changed(self):
         self.settings["print_dots"] = self.print_dots.get()
@@ -385,6 +486,15 @@ class App:
             self.footer.set(f"Settings could not be saved. {exc}")
 
     def changed(self):
+        snapshot = self.design_snapshot()
+        if self.history[self.history_index][0] != snapshot:
+            self.history[self.history_index + 1:] = [(snapshot, self.selected.copy())]
+            if len(self.history) > 81:
+                self.history.pop(0)
+            self.history_index = len(self.history) - 1
+        self.schedule_save()
+
+    def schedule_save(self):
         self.dirty = True
         if self.save_timer is not None:
             self.root.after_cancel(self.save_timer)
@@ -392,6 +502,44 @@ class App:
         if self.render_timer is not None:
             self.root.after_cancel(self.render_timer)
         self.render_timer = self.root.after(130, self.refresh)
+
+    def design_snapshot(self, doc=None):
+        # Imported data and image strings are replaced as units, so snapshots share their storage.
+        if doc is None:
+            doc = self.doc
+        return {**doc, "batch": doc["batch"].copy(), "elements": [item.copy() for item in doc["elements"]]}
+
+    def update_edit_menu(self):
+        for index, enabled in enumerate((self.history_index > 0, self.history_index < len(self.history) - 1,
+                                         bool(self.selected))):
+            self.edit_menu.entryconfigure(index, state="normal" if enabled else "disabled")
+
+    @staticmethod
+    def editor_shortcut(event, action):
+        if event.widget.winfo_class() not in ("Text", "Entry", "TEntry", "TCombobox", "TSpinbox", "Spinbox"):
+            action()
+            return "break"
+
+    def restore_design(self, index):
+        if not 0 <= index < len(self.history):
+            return
+        self.history_index = index
+        doc, selected = self.history[index]
+        self.doc = self.design_snapshot(doc)
+        self.selected = selected.copy()
+        self.drag = None
+        self.rebuild_elements()
+        self.rebuild_page()
+        if self.render_timer is not None:
+            self.root.after_cancel(self.render_timer)
+        self.refresh()
+        self.schedule_save()
+
+    def undo(self):
+        self.restore_design(self.history_index - 1)
+
+    def redo(self):
+        self.restore_design(self.history_index + 1)
 
     def autosave(self):
         self.save_timer = None
@@ -447,8 +595,18 @@ class App:
 
     def open_saved(self, as_copy=False):
         selection = self.library_tree.selection()
-        if selection:
-            self.load_project(self.library_paths[selection[0]], as_copy)
+        if not selection:
+            return
+        key = selection[0]
+        if key in self.library_paths:
+            self.load_project(self.library_paths[key], as_copy)
+        elif key in self.builtins:
+            if self.dirty and not self.save():
+                return
+            self.doc = copy.deepcopy(self.builtins[key])
+            self.doc["id"] = uuid4().hex
+            self.load_editor()
+            self.save()
 
     def open_file(self):
         path = filedialog.askopenfilename(parent=self.root, filetypes=[("Stupid Print", "*" + EXTENSION)])
@@ -501,6 +659,20 @@ class App:
             self.preview_number = 1
             self.changed()
 
+    def export_pdf(self):
+        try:
+            batch = Batch(self.design_snapshot())
+        except ValueError as exc:
+            messagebox.showerror("Export batch PDF", str(exc), parent=self.root)
+            return
+        paper = ChoiceDialog(self.root, "Export batch PDF", tuple(PAPER_SIZES), "Proof sheet size").result
+        if paper is None:
+            return
+        path = filedialog.asksaveasfilename(parent=self.root, defaultextension=".pdf",
+                                            filetypes=[("PDF document", "*.pdf")])
+        if path:
+            ProofDialog(self, batch, Path(path), paper)
+
     def import_source(self):
         path = filedialog.askopenfilename(parent=self.root,
                                           filetypes=[("CSV, TSV or Excel", "*.csv *.tsv *.xlsx *.xlsm")])
@@ -511,7 +683,7 @@ class App:
             if Path(path).suffix.lower() in (".xlsx", ".xlsm"):
                 sheets = excel_sheets(path)
                 if len(sheets) > 1:
-                    sheet = ChoiceDialog(self.root, "Choose worksheet", sheets).result
+                    sheet = ChoiceDialog(self.root, "Choose worksheet", sheets, "Worksheet").result
                     if sheet is None:
                         return
             self.doc["data"] = import_data(path, sheet)
@@ -557,6 +729,11 @@ class App:
     def load_editor(self):
         self.preview_number = 1
         self.selected = [item["id"] for item in self.doc["elements"][:1]]
+        self.history = [(self.design_snapshot(), self.selected.copy())]
+        self.history_index = 0
+        self.drag = None
+        if self.render_timer is not None:
+            self.root.after_cancel(self.render_timer)
         self.rebuild_elements()
         self.rebuild_page()
         self.refresh()
@@ -696,6 +873,8 @@ class App:
     def select(self, ids, sync_layers=True):
         if set(ids) != set(self.selected):
             self.selected = ids
+            doc, _ = self.history[self.history_index]
+            self.history[self.history_index] = (doc, ids.copy())
             self.rebuild_elements(sync_layers=sync_layers)
             self.draw_stage()
 
@@ -713,15 +892,23 @@ class App:
         width = min(w - 2, 10) if kind in ("graphic", "image") else w - 2
         if kind == "graphic" and values.get("asset") == "rule":
             width, height = w - 2, .75
+        if kind == "matrix":
+            width = height = min(w - 2, bottom - top - .5)
         previous = self.item()
         below = previous["y"] + previous["h"] + .5 if previous else top + 1
         y = below if below + height <= bottom else top + .5
-        item = element(kind, x=1, y=y, w=width, h=height, **values)
+        x = w - width - 1 if kind == "matrix" else 1
+        item = element(kind, x=x, y=y, w=width, h=height, **values)
         self.doc["elements"].append(item)
         self.selected = [item["id"]]
         self.tabs.select(self.item_panel)
         self.rebuild_elements()
         self.changed()
+
+    def add_matrix(self):
+        symbology = ChoiceDialog(self.root, "Add a 2D code", MATRIX_CODES).result
+        if symbology:
+            self.add_item("matrix", symbology=symbology)
 
     def add_image(self, replace=False):
         path = filedialog.askopenfilename(parent=self.root,
@@ -752,9 +939,38 @@ class App:
             self.add_item("graphic", asset=key)
 
     def duplicate_item(self):
-        copies = [{**source, "id": uuid4().hex} for source in self.items()]
+        self.insert_copies(self.items())
+
+    def copy_items(self):
+        items = self.items()
+        if items:
+            self.root.clipboard_clear()
+            self.root.clipboard_append("Stupid Print elements\n" + json.dumps(items))
+            self.footer.set(f"Copied {len(items)} element(s)")
+
+    def paste_items(self):
+        try:
+            prefix, _, payload = self.root.clipboard_get().partition("\n")
+            if prefix != "Stupid Print elements":
+                raise ValueError
+            items = json.loads(payload)
+            if not isinstance(items, list):
+                raise ValueError
+            used = set()
+            for item in items:
+                validate_element(item, used)
+        except (tk.TclError, ValueError, TypeError, KeyError):
+            self.footer.set("Copy elements from a Stupid Print label before pasting.")
+            return
+        self.insert_copies(items)
+
+    def insert_copies(self, sources):
+        copies = [{**source, "id": uuid4().hex} for source in sources]
         if copies:
-            placement.move(copies, placement.bounds(copies), 1, 1, dimensions(self.doc))
+            page = dimensions(self.doc)
+            placement.move(copies, placement.bounds(copies), 1, 1, page)
+            for item in copies:
+                placement.fit_box(item, page)
             self.doc["elements"].extend(copies)
             self.selected = [item["id"] for item in copies]
             self.rebuild_elements()
@@ -790,7 +1006,8 @@ class App:
         summary = " ".join(name.split())
         if len(summary) > 30:
             summary = summary[:29] + "…"
-        return f"{item['kind'].title()}   {summary}".strip()
+        kind = item["symbology"] if item["kind"] == "matrix" else item["kind"].title()
+        return f"{kind}   {summary}".strip()
 
     def rebuild_elements(self, sync_layers=True):
         if sync_layers:
@@ -813,7 +1030,7 @@ class App:
             for panel in (parent, self.style_panel):
                 ttk.Label(panel, text=hint, wraplength=245, style="Muted.TLabel").pack(anchor="w")
             return
-        if item["kind"] in ("text", "barcode"):
+        if item["kind"] in ("text", "barcode", "matrix"):
             self.content_controls(parent, item)
         elif item["kind"] == "image":
             ttk.Label(parent, text=item["filename"], wraplength=235).pack(anchor="w")
@@ -834,19 +1051,40 @@ class App:
                 self.check_item(row, item, key, label, side="left")
             self.item_field(parent, item, "align", "Horizontal alignment", ("Left", "Center", "Right"))
             self.item_field(parent, item, "valign", "Vertical alignment", ("Top", "Middle", "Bottom"))
+            self.item_field(parent, item, "rotation", "Clockwise rotation", ("0°", "90°", "180°", "270°"))
             self.check_item(parent, item, "fit", "Shrink to fit")
         elif item["kind"] == "barcode":
             self.item_field(parent, item, "symbology", "Barcode type", tuple(BARCODES))
             self.check_item(parent, item, "caption", "Show barcode value")
             self.check_item(parent, item, "compact", "Allow compact bars (1 dot)")
             ttk.Label(parent, text="Use wider bars for easier scanning.", style="Muted.TLabel").pack(anchor="w")
+        elif item["kind"] == "matrix":
+            symbology = tk.StringVar(value=item["symbology"])
+            control = field(parent, "2D code type", symbology, MATRIX_CODES)
+
+            def change_format(_):
+                item["symbology"] = symbology.get()
+                self.rebuild_elements()
+                self.changed()
+
+            control.bind("<<ComboboxSelected>>", change_format)
+            if item["symbology"] == "QR Code":
+                self.item_field(parent, item, "correction", "Error correction", QR_LEVELS)
+                note = "L fits the most data. H recovers the most damage."
+            else:
+                note = "Data Matrix uses built-in ECC 200 error correction."
+            ttk.Label(parent, text=note + " The code reserves its own white margin. Keep other elements clear.",
+                      wraplength=235, style="Muted.TLabel").pack(anchor="w", pady=5)
         elif item["kind"] == "image":
             self.check_item(parent, item, "dither", "Dither image")
             ttk.Label(parent, text="Dither photos for tonal detail. Turn it off for solid logos.",
                       wraplength=235, style="Muted.TLabel").pack(anchor="w", pady=5)
         elif item["kind"] == "graphic":
-            self.check_item(parent, item, "dither", "Dither shading")
-            ttk.Label(parent, text="Turn off shading for a high-contrast graphic.",
+            ghs = item["asset"] in GHS_ARTWORK
+            if not ghs:
+                self.check_item(parent, item, "dither", "Dither shading")
+            ttk.Label(parent, text="Monochrome reference artwork." if ghs else
+                      "Turn off shading for a high-contrast graphic.",
                       wraplength=235, style="Muted.TLabel").pack(anchor="w", pady=5)
 
     def font_control(self, parent, item):
@@ -977,7 +1215,8 @@ class App:
                 self.changed()
 
         text.bind("<<Modified>>", update)
-        tokens = ["serial", "ip", "subnet", "prefix", "cidr", "index", "date"]
+        tokens = ["serial", "ip", "subnet", "prefix", "cidr", "mac", "hostname", "port",
+                  "index", "date", "date+30d", "expiry"]
         tokens.extend(f"field:{name}" for name in self.doc["data"]["headers"])
         token = tk.StringVar(value="Insert a field…")
         choices = ttk.Combobox(parent, textvariable=token, state="readonly", values=tokens, width=16)
@@ -1121,9 +1360,32 @@ class App:
         self.persist_settings()
         PrintDialog(self, batch, min(self.preview_number, batch.count), port)
 
+    def open_history(self):
+        try:
+            JobHistoryDialog(self, self.jobs.recent(), self.jobs.has_reprint())
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            messagebox.showerror("Print history", str(exc), parent=self.root)
+
+    def reprint_last(self):
+        try:
+            last = self.jobs.last_batch()
+            if last is None:
+                return
+            device, snapshot = last
+            port = self.selected_port() or self.ports.get(device, PrinterPort(device))
+            batch = Batch(snapshot["document"], today=date.fromisoformat(snapshot["date"]))
+            ranges = [tuple(pair) for pair in snapshot["ranges"]]
+            PrintDialog(self, batch, ranges[0][0], port, ranges=ranges, copies=snapshot["copies"])
+        except (OSError, sqlite3.Error, ValueError, KeyError, TypeError, IndexError) as exc:
+            messagebox.showerror("Reprint last batch", str(exc), parent=self.root)
+
     def close(self):
         if self.printer_busy and any(isinstance(window, PrintDialog) for window in self.root.winfo_children()):
             return
+        for window in self.root.winfo_children():
+            if isinstance(window, ProofDialog):
+                window.request_stop()
+                return
         if self.dirty and not self.save():
             return
         self.root.destroy()

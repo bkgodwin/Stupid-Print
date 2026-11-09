@@ -1,9 +1,11 @@
 """Built-in graphics on a 24-unit vector grid. Label files reference the keys."""
 
 from dataclasses import dataclass
+from functools import lru_cache
 from math import cos, pi, sin
+from pathlib import Path
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageChops, ImageDraw, ImageOps
 
 
 @dataclass(frozen=True)
@@ -55,6 +57,17 @@ def symbol(name, *parts):
 
 def shape(name, *parts):
     return Graphic(name, "Shapes", parts, stretch=True)
+
+
+def safety(name, *parts):
+    return Graphic(name, "Safety & science", parts)
+
+
+GHS_ARTWORK = {
+    "ghs-oxidizer": "Flame over circle", "ghs-flame": "Flame", "ghs-explosive": "Exploding bomb",
+    "ghs-skull": "Skull and crossbones", "ghs-corrosion": "Corrosion", "ghs-gas": "Gas cylinder",
+    "ghs-health": "Health hazard", "ghs-environment": "Environment", "ghs-exclamation": "Exclamation mark",
+}
 
 
 GRAPHICS = {
@@ -161,6 +174,28 @@ GRAPHICS = {
     "warning": symbol("Warning",
         polygon(((12, 2), (22, 21), (2, 21)), 231),
         stroke(((12, 8), (12, 14)), 2.3), oval((10.8, 16.1, 13.2, 18.5), 0, None)),
+    "safety-warning": safety("Warning triangle",
+        polygon(((12, 2), (22, 21), (2, 21)), 255),
+        stroke(((12, 8), (12, 14)), 2.3), oval((10.8, 16.1, 13.2, 18.5), 0, None)),
+    "biohazard": safety("Biohazard",
+        oval((5.5, 5.5, 18.5, 18.5), 255, 0, 2),
+        *(oval((x - 5.2, y - 5.2, x + 5.2, y + 5.2), 0, None)
+          for x, y in ((12, 6.4), (7.15, 14.8), (16.85, 14.8))),
+        *(oval((x - 3.6, y - 3.6, x + 3.6, y + 3.6), 255, None)
+          for x, y in ((12, 4.1), (5.16, 15.95), (18.84, 15.95))),
+        oval((10.4, 10.4, 13.6, 13.6), 255, None)),
+    "flask": safety("Laboratory flask",
+        polygon(((9, 3), (15, 3), (15, 9), (21, 19), (20, 22), (4, 22), (3, 19), (9, 9))),
+        stroke(((7, 3), (17, 3)), 1.7), stroke(((6, 15), (18, 15))),
+        oval((9, 17, 11, 19), 0, None), oval((14, 18, 16, 20), 0, None)),
+    "calibrated": safety("Calibrated",
+        polygon(regular_polygon(12, 8.8)), oval((5, 5, 19, 19), 255),
+        stroke(((8, 12), (11, 15), (16, 9)), 2)),
+    "do-not-remove": safety("Do not remove",
+        oval((2, 2, 22, 22), 255, 0, 2),
+        polygon(((5, 8), (15, 8), (19, 12), (15, 16), (5, 16)), 255, 0, 1),
+        oval((14, 11, 16, 13), 0, None), stroke(((5, 5), (19, 19)), 2)),
+    **{key: Graphic(name, "GHS reference", ()) for key, name in GHS_ARTWORK.items()},
     "check": symbol("Check mark", stroke(((3, 12), (9, 18), (21, 5)), 3.2)),
     "cross": symbol("Cross", stroke(((5, 5), (19, 19)), 3), stroke(((19, 5), (5, 19)), 3)),
     "star": symbol("Star", polygon(regular_polygon(5, 4.8), 0, None)),
@@ -207,6 +242,11 @@ EMOJI_GRAPHICS = {
 
 def vector_image(key, size):
     """Draw the built-in geometry into a grayscale image at the requested size."""
+    if key in GHS_ARTWORK:
+        source = ImageOps.contain(_hazard_image(key), size, Image.Resampling.LANCZOS)
+        result = Image.new("L", size, 255)
+        result.paste(source, ((size[0] - source.width) // 2, (size[1] - source.height) // 2))
+        return result
     graphic = GRAPHICS[key]
     width, height = size
     sx, sy = (width - 1) / 24, (height - 1) / 24
@@ -241,11 +281,22 @@ def vector_image(key, size):
     return image
 
 
+@lru_cache(maxsize=len(GHS_ARTWORK))
+def _hazard_image(key):
+    path = Path(__file__).with_name("assets") / "ghs" / (key.removeprefix("ghs-") + ".png")
+    with Image.open(path) as source:
+        artwork = source.convert("RGBA")
+    red, green, blue, alpha = artwork.split()
+    # The original red frame and black symbol both become black on thermal stock.
+    gray = ImageChops.darker(ImageChops.darker(red, green), blue)
+    return Image.composite(gray, Image.new("L", artwork.size, 255), alpha)
+
+
 def graphic_layer(key, size, smooth=False, dither=True):
     layer = vector_image(key, (size[0] * 3, size[1] * 3))
     if smooth:
         return layer
     layer = layer.resize(size, Image.Resampling.LANCZOS)
-    if dither:
+    if dither and key not in GHS_ARTWORK:
         return layer.convert("1", dither=Image.Dither.FLOYDSTEINBERG).convert("L")
     return layer.point(lambda pixel: 0 if pixel < 150 else 255)

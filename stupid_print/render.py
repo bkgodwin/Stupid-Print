@@ -9,6 +9,7 @@ import unicodedata
 from functools import lru_cache
 
 import barcode
+import zxingcpp
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps, features
 
 from .artwork import EMOJI_GRAPHICS, graphic_layer, vector_image
@@ -21,6 +22,7 @@ DOTS_PER_MM = 8
 HEAD_DOTS = 96
 TEXT_SCALE = 3
 BARCODES = {"Code 128": "code128", "Code 39": "code39", "EAN-13": "ean13", "UPC-A": "upca"}
+MATRIX_FORMATS = {"QR Code": (zxingcpp.QRCode, 4), "Data Matrix": (zxingcpp.DataMatrix, 1)}
 HAS_EMOJI_SHAPING = features.check("raqm")
 
 
@@ -301,6 +303,35 @@ def _barcode_image(item, value, size):
     return image, bars
 
 
+@lru_cache(maxsize=128)
+def _matrix_modules(symbology, value, correction):
+    format_code, _ = MATRIX_FORMATS[symbology]
+    options = {"ec_level": correction} if symbology == "QR Code" else {}
+    try:
+        code = zxingcpp.create_barcode(value, format_code, **options)
+        return Image.fromarray(code.to_image(scale=1, add_quiet_zones=False)).copy()
+    except (RuntimeError, ValueError, UnicodeError) as exc:
+        raise ValueError(f"Cannot encode the {symbology} value. Check the content or shorten it.") from exc
+
+
+def _matrix_image(item, value, size):
+    name = item["symbology"]
+    if not value.strip():
+        raise ValueError(f"Enter a value for the {name}.")
+    modules = _matrix_modules(name, value, item["correction"])
+    _, quiet = MATRIX_FORMATS[name]
+    columns, rows = modules.width + 2 * quiet, modules.height + 2 * quiet
+    module = min(size[0] // columns, size[1] // rows)
+    if module < 2:
+        raise ValueError(f"The {name} needs at least {columns * 2 / DOTS_PER_MM:g} × "
+                         f"{rows * 2 / DOTS_PER_MM:g} mm for 2-dot modules. "
+                         "Enlarge the box or shorten the value.")
+    raster = modules.resize((modules.width * module, modules.height * module), Image.Resampling.NEAREST)
+    layer = Image.new("L", size, 255)
+    layer.paste(raster, ((size[0] - raster.width) // 2, (size[1] - raster.height) // 2))
+    return layer
+
+
 def embed_image(path):
     with Image.open(path) as source:
         image = ImageOps.exif_transpose(source).convert("RGBA")
@@ -366,12 +397,20 @@ def render_label(doc, batch, index, *, smooth=False):
         display_size = (size[0] * scale, size[1] * scale)
         if kind == "text":
             value = batch.expand(item["value"], context)
-            layer = _text_image(item, value, size, smooth=smooth)
-        elif kind == "barcode":
+            rotation = item.get("rotation", "0°")
+            text_size = size[::-1] if rotation in ("90°", "270°") else size
+            layer = _text_image(item, value, text_size, smooth=smooth)
+            if rotation != "0°":
+                layer = layer.rotate(-int(rotation[:-1]), expand=True)
+        elif kind in ("barcode", "matrix"):
             if (x < 0 or x + display_size[0] > width or y < margin
                     or y + display_size[1] > min(height, margin + head)):
                 raise ValueError("Move the barcode box inside the printable area.")
-            layer, bars = _barcode_image(item, batch.expand(item["value"], context), size)
+            value = batch.expand(item["value"], context)
+            if kind == "matrix":
+                layer, bars = _matrix_image(item, value, size), size[1]
+            else:
+                layer, bars = _barcode_image(item, value, size)
             if smooth:
                 layer = layer.resize(display_size, Image.Resampling.NEAREST)
             # White spaces and quiet zones are part of a scannable symbol.
